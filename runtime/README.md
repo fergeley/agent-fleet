@@ -3,9 +3,8 @@
 Run `agent-fleet` in PowerShell or CMD, or open the **Agent Fleet** desktop shortcut.
 The shorter `fleet` command is an alias.
 
-- `SingleWindow` (default) opens all configured jobs in one maximized Windows Terminal 2x2 grid.
+- `SingleWindow` (default) opens up to 4 tabs (max 4 panes per tab, 16 jobs total) in one Windows Terminal window.
 - `JobWindows` opens one independent Terminal window per job.
-- `Claude` opens `claude agents` and `Codex` opens `codex agents` by default; `Antigravity` (`agy`) and `OpenCode` (`opencode`) open interactively.
-- Use optional per-job `Args` and `Env` in `manifest.json` to override startup arguments or environment variables.
-- `agent-fleet -Status` inspects window, shell, Git worktree, and Claude background session state.
-- `agent-fleet -NewWorktree`, `-Dispatch`, and `-Queue` manage worktrees and background task runs.
+- `Claude` opens `claude agents` and `Codex` opens `codex agents` by default; `OpenCode` supports multi-session CLI tabs; `Antigravity` (`agy`) runs one conversation per pane and scales across `Tab` groups or `-OpenTab`.
+- `-Profile <name>` isolates `profiles/<name>/manifest.json`, state, and window identity per workspace.
+- `-Status [-Watch]`, `-NewWorktree`, `-OpenTab`, `-CleanWorktree`, `-Dispatch`, and `-Queue` manage sessions and worktrees safely.

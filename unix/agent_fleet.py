@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform macOS and Linux (tmux) runtime for Agent Fleet 2.0.0."""
+"""Cross-platform macOS and Linux (tmux) runtime for Agent Fleet 2.1.0."""
 
 from __future__ import annotations
 
@@ -34,11 +34,17 @@ GIT_OVERRIDE_ENV = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 }
 JOB_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+TAB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9 _-]{0,31}$")
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 HEX64_RE = re.compile(r"^[A-F0-9]{64}$")
 COMMIT40_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_UPDATE_REPO = "fergeley/agent-fleet"
+MAX_COPY_FILE_BYTES = 10 * 1024 * 1024
+MAX_COPY_FILES = 64
+MAX_INCLUDE_BYTES = 64 * 1024
 
 
 def default_install_root() -> Path:
@@ -55,6 +61,30 @@ def default_manifest_path() -> Path:
 
 def default_bin_dir() -> Path:
     return Path.home() / ".local" / "bin"
+
+
+def validate_profile_name(profile: str) -> str:
+    if not profile:
+        return ""
+    if not PROFILE_NAME_RE.match(profile):
+        raise ValueError(f"Invalid profile name (use 1-32 lowercase letters, digits, or hyphens): {profile}")
+    return profile
+
+
+def resolve_manifest_path(explicit_manifest: str, install_root: Path, profile: str = "") -> Path:
+    validate_profile_name(profile)
+    if explicit_manifest:
+        return Path(explicit_manifest)
+    if profile:
+        return install_root / "profiles" / profile / "manifest.json"
+    return default_manifest_path()
+
+
+def resolve_state_dir(install_root: Path, profile: str = "") -> Path:
+    validate_profile_name(profile)
+    if profile:
+        return install_root / "profiles" / profile / "state"
+    return install_root / "state"
 
 
 def ensure_absolute_path(value: str, label: str = "Path") -> str:
@@ -98,6 +128,34 @@ def parse_job_env(job: dict[str, Any], job_id: str) -> dict[str, str] | None:
     return parsed
 
 
+def parse_job_tab(job: dict[str, Any], job_id: str) -> str:
+    raw = job.get("Tab")
+    if raw is None:
+        return "fleet"
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"The Jobs Tab field must be a non-empty string for {job_id}.")
+    tab = raw.strip()
+    if not TAB_NAME_RE.match(tab):
+        raise ValueError(f"The Jobs Tab name is invalid for {job_id}: {tab}")
+    return tab
+
+
+def validate_tab_colors(manifest: dict[str, Any]) -> dict[str, str]:
+    raw = manifest.get("TabColors")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("TabColors must be an object mapping tab names to #RRGGBB colors.")
+    colors: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not TAB_NAME_RE.match(k):
+            raise ValueError(f"The TabColors tab name is invalid: {k}")
+        if not isinstance(v, str) or not HEX_COLOR_RE.match(v):
+            raise ValueError(f"TabColors value for {k} must be a #RRGGBB hex color.")
+        colors[k] = v
+    return colors
+
+
 def client_arguments(client: str, custom_args: list[str] | None = None) -> list[str]:
     if custom_args is not None:
         return list(custom_args)
@@ -114,11 +172,13 @@ def validate_manifest(manifest: dict[str, Any], job_id: str = "") -> tuple[str, 
     layout = manifest.get("JobsLayout", "SingleWindow")
     if layout not in ("SingleWindow", "JobWindows"):
         raise ValueError("The Jobs layout is invalid.")
+    validate_tab_colors(manifest)
     raw_jobs = manifest.get("Jobs")
-    if not isinstance(raw_jobs, list) or not (1 <= len(raw_jobs) <= 4):
-        raise ValueError("Configure one to four Jobs entries.")
+    if not isinstance(raw_jobs, list) or not (1 <= len(raw_jobs) <= 16):
+        raise ValueError("Configure 1 to 16 Jobs entries.")
 
     seen_ids: set[str] = set()
+    tab_counts: dict[str, int] = {}
     definitions: list[dict[str, Any]] = []
     for entry in raw_jobs:
         if not isinstance(entry, dict):
@@ -129,6 +189,12 @@ def validate_manifest(manifest: dict[str, Any], job_id: str = "") -> tuple[str, 
         if jid in seen_ids:
             raise ValueError(f"The Jobs ID is duplicated: {jid}")
         seen_ids.add(jid)
+        tab_name = parse_job_tab(entry, jid)
+        tab_counts[tab_name] = tab_counts.get(tab_name, 0) + 1
+        if tab_counts[tab_name] > 4:
+            raise ValueError(f"Tab '{tab_name}' exceeds the limit of 4 panes per tab.")
+        if len(tab_counts) > 4:
+            raise ValueError("Configure at most 4 distinct tabs in SingleWindow.")
         if job_id and jid != job_id:
             continue
         client = entry.get("Client")
@@ -146,6 +212,7 @@ def validate_manifest(manifest: dict[str, Any], job_id: str = "") -> tuple[str, 
             {
                 "Id": jid,
                 "Client": client,
+                "Tab": tab_name,
                 "Directory": directory,
                 "Executable": exe,
                 "NativeArguments": client_arguments(client, custom_args),
@@ -192,75 +259,75 @@ def build_pane_command(job: dict[str, Any]) -> list[str]:
     return cmd
 
 
-def tmux_session_name(install_root: Path, suffix: str) -> str:
-    tag = hashlib.sha256(str(install_root).encode("utf-8")).hexdigest()[:8]
+def tmux_session_name(install_root: Path, suffix: str, profile: str = "") -> str:
+    validate_profile_name(profile)
+    raw = str(install_root) if not profile else f"{install_root}|{profile}"
+    tag = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"agent-fleet-{tag}-{suffix}"
+
+
+def _build_tab_split_commands(session: str, win_idx: int, tab_name: str, jobs: list[dict[str, Any]], create_session: bool) -> list[list[str]]:
+    steps: list[list[str]] = []
+    first = jobs[0]
+    if create_session:
+        steps.append(["new-session", "-d", "-s", session, "-n", tab_name, "-c", first["Directory"], *build_pane_command(first)])
+    else:
+        steps.append(["new-window", "-t", session, "-n", tab_name, "-c", first["Directory"], *build_pane_command(first)])
+
+    target_base = f"{session}:{win_idx}"
+    if len(jobs) == 2:
+        steps.append(["split-window", "-h", "-t", f"{target_base}.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
+        steps.append(["select-layout", "-t", target_base, "even-horizontal"])
+    elif len(jobs) == 3:
+        steps.append(["split-window", "-h", "-t", f"{target_base}.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
+        steps.append(["split-window", "-v", "-t", f"{target_base}.0", "-c", jobs[2]["Directory"], *build_pane_command(jobs[2])])
+        steps.append(["select-layout", "-t", target_base, "tiled"])
+    elif len(jobs) == 4:
+        steps.append(["split-window", "-h", "-t", f"{target_base}.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
+        steps.append(["split-window", "-v", "-t", f"{target_base}.1", "-c", jobs[3]["Directory"], *build_pane_command(jobs[3])])
+        steps.append(["split-window", "-v", "-t", f"{target_base}.0", "-c", jobs[2]["Directory"], *build_pane_command(jobs[2])])
+        steps.append(["select-layout", "-t", target_base, "tiled"])
+    return steps
 
 
 def build_launch_plan(
     manifest: dict[str, Any],
     install_root: Path,
     job_id: str = "",
+    profile: str = "",
 ) -> dict[str, Any]:
     layout, jobs = validate_manifest(manifest, job_id=job_id)
     if layout == "SingleWindow":
-        session = tmux_session_name(install_root, "single")
+        session = tmux_session_name(install_root, "single", profile=profile)
+        tab_groups: dict[str, list[dict[str, Any]]] = {}
+        for job in jobs:
+            tab_groups.setdefault(job["Tab"], []).append(job)
         steps: list[list[str]] = []
-        first = jobs[0]
-        steps.append(
-            [
-                "new-session",
-                "-d",
-                "-s",
-                session,
-                "-n",
-                "fleet",
-                "-c",
-                first["Directory"],
-                *build_pane_command(first),
-            ]
-        )
-        if len(jobs) == 2:
-            steps.append(["split-window", "-h", "-t", f"{session}:0.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
-            steps.append(["select-layout", "-t", f"{session}:0", "even-horizontal"])
-        elif len(jobs) == 3:
-            steps.append(["split-window", "-h", "-t", f"{session}:0.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
-            steps.append(["split-window", "-v", "-t", f"{session}:0.0", "-c", jobs[2]["Directory"], *build_pane_command(jobs[2])])
-            steps.append(["select-layout", "-t", f"{session}:0", "tiled"])
-        elif len(jobs) == 4:
-            steps.append(["split-window", "-h", "-t", f"{session}:0.0", "-c", jobs[1]["Directory"], *build_pane_command(jobs[1])])
-            steps.append(["split-window", "-v", "-t", f"{session}:0.1", "-c", jobs[3]["Directory"], *build_pane_command(jobs[3])])
-            steps.append(["split-window", "-v", "-t", f"{session}:0.0", "-c", jobs[2]["Directory"], *build_pane_command(jobs[2])])
-            steps.append(["select-layout", "-t", f"{session}:0", "tiled"])
+        tabs_meta = []
+        for idx, (tab_name, tab_jobs) in enumerate(tab_groups.items()):
+            steps.extend(_build_tab_split_commands(session, idx, tab_name, tab_jobs, create_session=(idx == 0)))
+            tabs_meta.append({"Tab": tab_name, "JobIds": [j["Id"] for j in tab_jobs]})
         return {
             "Mode": "Jobs",
             "Layout": "SingleWindow",
+            "Profile": profile or None,
+            "Tabs": tabs_meta,
             "Sessions": [{"SessionName": session, "TmuxCommands": steps, "Jobs": jobs}],
         }
 
     sessions = []
     for job in jobs:
-        session = tmux_session_name(install_root, job["Id"])
+        session = tmux_session_name(install_root, job["Id"], profile=profile)
         sessions.append(
             {
                 "SessionName": session,
                 "TmuxCommands": [
-                    [
-                        "new-session",
-                        "-d",
-                        "-s",
-                        session,
-                        "-n",
-                        job["Id"],
-                        "-c",
-                        job["Directory"],
-                        *build_pane_command(job),
-                    ]
+                    ["new-session", "-d", "-s", session, "-n", job["Id"], "-c", job["Directory"], *build_pane_command(job)]
                 ],
                 "Jobs": [job],
             }
         )
-    return {"Mode": "Jobs", "Layout": "JobWindows", "Sessions": sessions}
+    return {"Mode": "Jobs", "Layout": "JobWindows", "Profile": profile or None, "Sessions": sessions}
 
 
 def git_status(directory: str) -> dict[str, Any]:
@@ -318,19 +385,23 @@ def tmux_has_session(session: str) -> bool:
     return proc.returncode == 0
 
 
-def status_snapshot(manifest: dict[str, Any], install_root: Path, job_id: str = "") -> dict[str, Any]:
+def status_snapshot(manifest: dict[str, Any], install_root: Path, job_id: str = "", profile: str = "") -> dict[str, Any]:
     layout = manifest.get("JobsLayout", "SingleWindow")
     rows = []
     for entry in manifest.get("Jobs", []):
         jid = entry.get("Id", "")
         if job_id and jid != job_id:
             continue
-        session = tmux_session_name(install_root, "single" if layout == "SingleWindow" else jid)
+        session = tmux_session_name(install_root, "single" if layout == "SingleWindow" else jid, profile=profile)
         tmux_state = "observed" if (shutil.which("tmux") and tmux_has_session(session)) else "absent"
         rows.append(
             {
                 "Id": jid,
-                "Configured": {"Client": entry.get("Client"), "Directory": entry.get("Directory")},
+                "Configured": {
+                    "Client": entry.get("Client"),
+                    "Tab": entry.get("Tab") or "fleet",
+                    "Directory": entry.get("Directory"),
+                },
                 "Session": {"Name": session, "State": tmux_state},
                 "Git": git_status(str(entry.get("Directory", ""))),
             }
@@ -338,14 +409,156 @@ def status_snapshot(manifest: dict[str, Any], install_root: Path, job_id: str = 
     return {
         "SchemaVersion": 2,
         "Result": "observed",
+        "Profile": profile or None,
         "Jobs": rows,
         "ProviderSessions": {"Claude": claude_sessions(str(manifest.get("Claude", "")))},
     }
 
 
-def new_worktree(repo: str, path: str, base_ref: str = "main", branch: str = "", lock: bool = False) -> dict[str, Any]:
+def _assert_safe_rel_copy_path(raw: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Worktree copy path cannot be empty.")
+    cleaned = raw.strip()
+    if os.path.isabs(cleaned) or cleaned.startswith(("/", "\\")) or ":" in cleaned:
+        raise ValueError(f"Worktree copy path must be relative: {cleaned}")
+    if "*" in cleaned or "?" in cleaned:
+        raise ValueError(f"Worktree copy path cannot contain wildcards: {cleaned}")
+    parts = [p for p in re.split(r"[/\\]", cleaned) if True]
+    for seg in parts:
+        if not seg or seg in (".", "..") or seg.lower() == ".git":
+            raise ValueError(f"Worktree copy path contains a blocked segment: {cleaned}")
+    return os.path.join(*parts)
+
+
+def get_relative_copy_paths(repo_root: Path, manifest: dict[str, Any] | None = None, allow_include: bool = False) -> list[str]:
+    raw_entries: list[str] = []
+    if manifest and manifest.get("WorktreeCopyFiles") is not None:
+        wcf = manifest["WorktreeCopyFiles"]
+        if not isinstance(wcf, list) or any(not isinstance(x, str) for x in wcf):
+            raise ValueError("WorktreeCopyFiles must be an array of relative file paths.")
+        raw_entries.extend(wcf)
+    if allow_include:
+        inc_path = repo_root / ".worktreeinclude"
+        if inc_path.exists() or inc_path.is_symlink():
+            if inc_path.is_symlink():
+                raise ValueError(".worktreeinclude cannot be a symlink.")
+            if not inc_path.is_file() or inc_path.stat().st_size > MAX_INCLUDE_BYTES:
+                raise ValueError(".worktreeinclude is invalid or exceeds 64 KiB.")
+            for line in inc_path.read_text(encoding="utf-8").splitlines():
+                trimmed = line.strip()
+                if not trimmed or trimmed.startswith("#"):
+                    continue
+                raw_entries.append(trimmed)
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in raw_entries:
+        rel = _assert_safe_rel_copy_path(entry)
+        key = rel.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(rel)
+    if len(result) > MAX_COPY_FILES:
+        raise ValueError(f"Worktree copy list exceeds {MAX_COPY_FILES} files.")
+    return result
+
+
+def _assert_no_symlink_between(path: Path, root: Path) -> None:
+    cur = path
+    root_real = os.path.realpath(str(root))
+    while True:
+        if cur.is_symlink():
+            raise ValueError(f"Path contains a symlink: {cur}")
+        if os.path.realpath(str(cur)) == root_real or cur == cur.parent:
+            break
+        cur = cur.parent
+
+
+def copy_worktree_files(repo_root: Path, target_worktree: Path, rel_paths: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+    copied: list[str] = []
+    skipped: list[dict[str, str]] = []
+    if not rel_paths:
+        return copied, skipped
+    canon_repo = Path(resolve_final_dir(repo_root))
+    canon_target = Path(resolve_final_dir(target_worktree))
+    for rel in rel_paths:
+        src = canon_repo / rel
+        if not src.exists() and not src.is_symlink():
+            skipped.append({"Path": rel, "Reason": "missing"})
+            continue
+        if src.is_symlink():
+            raise ValueError(f"Worktree copy source cannot be a symlink: {rel}")
+        _assert_no_symlink_between(src, canon_repo)
+        if src.is_dir():
+            raise ValueError(f"Worktree copy entry must be a regular file: {rel}")
+        if src.stat().st_size > MAX_COPY_FILE_BYTES:
+            raise ValueError(f"Worktree copy file exceeds 10 MiB limit: {rel}")
+        src_parent_real = resolve_final_dir(src.parent)
+        canon_repo_str = str(canon_repo)
+        if not (src_parent_real == canon_repo_str or src_parent_real.startswith(canon_repo_str + os.sep)):
+            raise ValueError(f"Worktree copy source escapes repository root: {rel}")
+        dst = canon_target / rel
+        dst_parent = dst.parent
+        # Ensure existing destination ancestors contain no symlinks
+        probe = dst
+        while True:
+            if probe.exists() or probe.is_symlink():
+                _assert_no_symlink_between(probe, canon_target)
+                break
+            if probe == canon_target or probe == probe.parent:
+                break
+            probe = probe.parent
+        if dst.exists() or dst.is_symlink():
+            skipped.append({"Path": rel, "Reason": "exists"})
+            continue
+        dst_parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst, follow_symlinks=False)
+        copied.append(rel)
+    return copied, skipped
+
+
+def known_worktrees(install_root: Path, default_manifest: Path | None = None) -> tuple[set[str], set[str]]:
+    dirs: set[str] = set()
+    git_dirs: set[str] = set()
+    manifest_files: list[Path] = []
+    root_manifest = default_manifest if default_manifest is not None else default_manifest_path()
+    if root_manifest.is_file():
+        manifest_files.append(root_manifest)
+    profiles_dir = install_root / "profiles"
+    if profiles_dir.is_dir():
+        for p in profiles_dir.iterdir():
+            pm = p / "manifest.json"
+            if pm.is_file():
+                manifest_files.append(pm)
+    for mp in manifest_files:
+        try:
+            data = json.loads(mp.read_text(encoding="utf-8"))
+            for job in data.get("Jobs", []):
+                d = str(job.get("Directory", ""))
+                if d and os.path.isdir(d):
+                    dirs.add(resolve_final_dir(d))
+                    gd = subprocess.run(["git", "-C", d, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True)
+                    if gd.returncode == 0 and gd.stdout.strip():
+                        git_dirs.add(resolve_final_dir(gd.stdout.strip()))
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+    return dirs, git_dirs
+
+
+def new_worktree(
+    repo: str,
+    path: str,
+    base_ref: str = "main",
+    branch: str = "",
+    lock: bool = False,
+    manifest: dict[str, Any] | None = None,
+    allow_worktree_include: bool = False,
+) -> dict[str, Any]:
     repo_abs = ensure_absolute_path(repo, "Repository")
     target_abs = ensure_absolute_path(path, "Worktree path")
+    if not base_ref.strip() or base_ref.strip().startswith("-"):
+        raise ValueError(f"Invalid base ref: {base_ref}")
+    if branch and branch.strip().startswith("-"):
+        raise ValueError(f"Invalid branch name: {branch}")
     if os.path.exists(target_abs):
         raise ValueError(f"The target worktree path already exists: {target_abs}")
     top_proc = subprocess.run(["git", "-C", repo_abs, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
@@ -355,6 +568,20 @@ def new_worktree(repo: str, path: str, base_ref: str = "main", branch: str = "",
     target_real = resolve_final_dir(target_abs)
     if target_real == top_real or target_real.startswith(top_real + os.sep):
         raise ValueError(f"Worktree path must be outside the repository: {target_abs}")
+
+    copy_root = Path(top_real)
+    common_proc = subprocess.run(["git", "-C", repo_abs, "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+    if common_proc.returncode == 0 and common_proc.stdout.strip():
+        cdir = common_proc.stdout.strip()
+        if not os.path.isabs(cdir):
+            cdir = os.path.abspath(os.path.join(repo_abs, cdir))
+        cparent = os.path.dirname(os.path.normpath(cdir))
+        if os.path.isdir(cparent):
+            copy_root = Path(resolve_final_dir(cparent))
+
+    use_include = bool(allow_worktree_include or (manifest and manifest.get("AllowWorktreeInclude")))
+    rel_copy_paths = get_relative_copy_paths(copy_root, manifest=manifest, allow_include=use_include)
+
     os.makedirs(os.path.dirname(target_abs), exist_ok=True)
     cmd = ["git", "-C", repo_abs, "worktree", "add"]
     cmd.extend(["-b", branch, target_abs, base_ref] if branch else ["--detach", target_abs, base_ref])
@@ -365,10 +592,217 @@ def new_worktree(repo: str, path: str, base_ref: str = "main", branch: str = "",
         lock_proc = subprocess.run(["git", "-C", repo_abs, "worktree", "lock", target_abs, "--reason", "Agent Fleet job slot"], capture_output=True, text=True)
         if lock_proc.returncode != 0:
             raise RuntimeError(f"Worktree created, but lock failed: {lock_proc.stderr.strip()}")
-    return {"Result": "created", "Path": target_abs, "Branch": branch or "(detached)", "BaseRef": base_ref, "Locked": lock}
+    copied, skipped = copy_worktree_files(copy_root, Path(target_abs), rel_copy_paths)
+    return {
+        "Result": "created",
+        "Path": target_abs,
+        "Branch": branch or "(detached)",
+        "BaseRef": base_ref,
+        "Locked": lock,
+        "CopiedFiles": copied,
+        "SkippedFiles": skipped,
+    }
 
 
-def dispatch_task(manifest: dict[str, Any], install_root: Path, client: str, directory: str, prompt: str, model: str = "", name: str = "") -> dict[str, Any]:
+def clean_worktree(
+    path: str,
+    install_root: Path,
+    base_ref: str = "",
+    dry_run: bool = False,
+    force: bool = False,
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    abs_path = ensure_absolute_path(path, "Worktree path")
+    p = Path(abs_path)
+    if p.is_symlink():
+        raise ValueError(f"Refusing to remove symlinked worktree path: {abs_path}")
+    if not p.is_dir():
+        raise ValueError(f"The worktree directory does not exist: {abs_path}")
+    canon_target = resolve_final_dir(abs_path)
+
+    gd_proc = subprocess.run(["git", "-C", canon_target, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True)
+    cd_proc = subprocess.run(["git", "-C", canon_target, "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+    if gd_proc.returncode != 0 or cd_proc.returncode != 0 or not gd_proc.stdout.strip():
+        raise ValueError(f"The path is not a Git worktree: {canon_target}")
+    canon_git = resolve_final_dir(gd_proc.stdout.strip())
+    raw_common = cd_proc.stdout.strip()
+    if not os.path.isabs(raw_common):
+        raw_common = os.path.join(canon_target, raw_common)
+    canon_common = resolve_final_dir(raw_common)
+    if canon_git == canon_common:
+        raise ValueError(f"Refusing to remove the main Git repository checkout: {canon_target}")
+
+    common_parent = os.path.dirname(canon_common)
+    wt_list_proc = subprocess.run(["git", "-C", common_parent, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    if wt_list_proc.returncode != 0:
+        raise RuntimeError("Could not inspect repository worktree list.")
+    found = False
+    is_locked = False
+    matched = False
+    for line in wt_list_proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            wt_real = resolve_final_dir(line[9:].strip())
+            matched = wt_real == canon_target
+            if matched:
+                found = True
+        elif matched and (line == "locked" or line.startswith("locked ")):
+            is_locked = True
+    if not found:
+        raise ValueError(f"Directory is not a registered linked worktree: {canon_target}")
+
+    dirs, git_dirs = known_worktrees(install_root, manifest_path)
+    if canon_git in git_dirs or canon_target in dirs:
+        raise ValueError(f"Refusing to remove a worktree configured in Agent Fleet: {canon_target}")
+
+    cwd_real = resolve_final_dir(os.getcwd())
+    if cwd_real == canon_target or cwd_real.startswith(canon_target + os.sep):
+        raise ValueError(f"Refusing to remove the current working directory or its ancestor: {canon_target}")
+
+    porcelain = subprocess.run(["git", "-C", canon_target, "status", "--porcelain"], capture_output=True, text=True)
+    if porcelain.returncode != 0:
+        raise RuntimeError(f"Could not inspect Git status for {canon_target}")
+    dirty = bool(porcelain.stdout.strip())
+    if dirty and not force:
+        raise ValueError("Worktree has uncommitted changes. Commit/discard or pass --force.")
+
+    head_proc = subprocess.run(["git", "-C", canon_target, "rev-parse", "HEAD"], capture_output=True, text=True)
+    wt_head = head_proc.stdout.strip()
+    up_proc = subprocess.run(["git", "-C", canon_target, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], capture_output=True, text=True)
+    unpushed = 0
+    if up_proc.returncode == 0 and up_proc.stdout.strip():
+        cnt_proc = subprocess.run(["git", "-C", canon_target, "rev-list", "--count", "@{u}..HEAD"], capture_output=True, text=True)
+        if cnt_proc.returncode == 0 and cnt_proc.stdout.strip().isdigit():
+            unpushed = int(cnt_proc.stdout.strip())
+        if unpushed > 0 and not force:
+            raise ValueError(f"Worktree has {unpushed} unpushed commit(s) ahead of {up_proc.stdout.strip()}.")
+
+    merge_target = ""
+    if base_ref:
+        if base_ref.strip().startswith("-"):
+            raise ValueError(f"Invalid base_ref: {base_ref}")
+        chk = subprocess.run(["git", "-C", common_parent, "rev-parse", "--verify", f"{base_ref.strip()}^{{commit}}"], capture_output=True, text=True)
+        if chk.returncode != 0:
+            raise ValueError(f"Base ref not found: {base_ref}")
+        merge_target = base_ref.strip()
+    else:
+        for cand in ("origin/HEAD", "refs/heads/main", "refs/heads/master", "refs/heads/develop", "HEAD"):
+            chk = subprocess.run(["git", "-C", common_parent, "rev-parse", "--verify", f"{cand}^{{commit}}"], capture_output=True, text=True)
+            if chk.returncode == 0:
+                merge_target = cand
+                break
+    merged = False
+    if merge_target:
+        anc = subprocess.run(["git", "-C", common_parent, "merge-base", "--is-ancestor", wt_head, merge_target], capture_output=True, text=True)
+        merged = anc.returncode == 0
+    if not merged and not force:
+        raise ValueError(f"Worktree HEAD ({wt_head[:8]}) is not merged into {merge_target}. Pass --force to override.")
+
+    commands = []
+    if is_locked:
+        commands.append(["git", "-C", common_parent, "worktree", "unlock", canon_target])
+    rm_cmd = ["git", "-C", common_parent, "worktree", "remove", *(["--force"] if force else []), canon_target]
+    commands.append(rm_cmd)
+
+    if dry_run:
+        return {
+            "Result": "dry-run",
+            "Path": canon_target,
+            "Locked": is_locked,
+            "Dirty": dirty,
+            "UnpushedCommits": unpushed,
+            "MergedInto": merge_target if merged else None,
+            "Commands": commands,
+        }
+
+    for cmd in commands:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Worktree cleanup failed: {res.stderr.strip()}")
+    return {"Result": "removed", "Path": canon_target, "WasLocked": is_locked, "Forced": force, "MergedInto": merge_target if merged else None}
+
+
+def open_tab(
+    manifest: dict[str, Any],
+    install_root: Path,
+    client: str,
+    directory: str = "",
+    repository: str = "",
+    branch: str = "",
+    base_ref: str = "main",
+    tab_title: str = "",
+    client_args: list[str] | None = None,
+    lock: bool = False,
+    allow_worktree_include: bool = False,
+    profile: str = "",
+    manifest_path: Path | None = None,
+    plan_only: bool = False,
+) -> dict[str, Any]:
+    if client not in SUPPORTED_CLIENTS:
+        raise ValueError(f"OpenTab client is unsupported: {client}")
+    exe = ensure_absolute_path(str(manifest.get(client, "")), client)
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        raise ValueError(f"The configured executable is unavailable: {client}")
+    if branch and branch.strip().startswith("-"):
+        raise ValueError(f"Invalid branch name: {branch}")
+    if not base_ref.strip() or base_ref.strip().startswith("-"):
+        raise ValueError(f"Invalid base ref: {base_ref}")
+    resolved_args = client_arguments(client, client_args)
+    created_wt = None
+    target_dir = directory
+    if not target_dir:
+        if not branch or not repository:
+            raise ValueError("--open-tab requires either --directory or both --repository and --branch.")
+        repo_abs = ensure_absolute_path(repository, "Repository")
+        top_proc = subprocess.run(["git", "-C", repo_abs, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if top_proc.returncode != 0 or not top_proc.stdout.strip():
+            raise ValueError(f"The path is not a Git repository: {repo_abs}")
+        repo_top = top_proc.stdout.strip()
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")
+        if not slug:
+            raise ValueError(f"Could not derive folder name from branch: {branch}")
+        candidate = os.path.join(os.path.dirname(repo_top), f"{os.path.basename(repo_top)}-{slug}")
+        if not plan_only:
+            created_wt = new_worktree(repo_top, candidate, base_ref=base_ref, branch=branch, lock=lock, manifest=manifest, allow_worktree_include=allow_worktree_include)
+            target_dir = created_wt["Path"]
+        else:
+            target_dir = candidate
+    else:
+        target_dir = ensure_absolute_path(target_dir, "Directory")
+        if not os.path.isdir(target_dir):
+            raise ValueError(f"The directory is unavailable: {target_dir}")
+
+    if os.path.isdir(target_dir):
+        gd = subprocess.run(["git", "-C", target_dir, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True)
+        if gd.returncode != 0 or not gd.stdout.strip():
+            raise ValueError(f"Directory is not a Git worktree: {target_dir}")
+        _, known_gits = known_worktrees(install_root, manifest_path)
+        if resolve_final_dir(gd.stdout.strip()) in known_gits:
+            raise ValueError(f"The worktree is already owned by a configured Agent Fleet job: {target_dir}")
+
+    win_name = tab_title.strip() if tab_title.strip() else (f"{client}:{branch}" if branch else f"{client}:{os.path.basename(target_dir)}")
+    session = tmux_session_name(install_root, "single", profile=profile)
+    if shutil.which("tmux") and tmux_has_session(session):
+        tmux_cmd = ["new-window", "-t", session, "-n", win_name, "-c", target_dir, exe, *resolved_args]
+        target = "existing"
+    else:
+        tmux_cmd = ["new-session", "-d", "-s", session, "-n", win_name, "-c", target_dir, exe, *resolved_args]
+        target = "new"
+    if not plan_only:
+        if not shutil.which("tmux"):
+            raise RuntimeError("Agent Fleet on macOS/Linux requires tmux on PATH.")
+        subprocess.run(["tmux", *tmux_cmd], check=True)
+    return {
+        "Result": "planned" if plan_only else "opened",
+        "WindowTarget": target,
+        "SessionName": session,
+        "TmuxCommand": tmux_cmd,
+        "Client": client,
+        "Directory": target_dir,
+        "Worktree": created_wt,
+    }
+
+
+def dispatch_task(manifest: dict[str, Any], install_root: Path, client: str, directory: str, prompt: str, model: str = "", name: str = "", profile: str = "") -> dict[str, Any]:
     if client not in ("Claude", "Codex"):
         raise ValueError(f"Dispatch supports Claude or Codex only: {client}")
     if not prompt.strip():
@@ -389,7 +823,7 @@ def dispatch_task(manifest: dict[str, Any], install_root: Path, client: str, dir
             raise RuntimeError(f"Claude background dispatch failed: {proc.stderr.strip()} {proc.stdout.strip()}".strip())
         return {"Result": "dispatched", "Client": "Claude", "Directory": dir_abs, "Output": proc.stdout.strip()}
 
-    state_dir = install_root / "state"
+    state_dir = resolve_state_dir(install_root, profile)
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path = state_dir / f"dispatch-codex-{int(time.time() * 1000)}.jsonl"
     cmd = [exe, "exec", "-C", dir_abs, "--json"]
@@ -430,11 +864,16 @@ def init_manifest(manifest_path: Path, worktrees: list[str], layout: str = "Sing
     clients = discover_clients()
     if not clients:
         raise RuntimeError("No supported agent CLI (codex, claude, agy, opencode) was found on PATH.")
-    if not (1 <= len(worktrees) <= 4):
-        raise ValueError("Pass 1 to 4 distinct Git worktrees via --worktree.")
+    if not (1 <= len(worktrees) <= 16):
+        raise ValueError("Pass 1 to 16 distinct Git worktrees via --worktree.")
     client_names = list(clients.keys())
     jobs = [
-        {"Id": f"job-{i + 1}", "Client": client_names[i % len(client_names)], "Directory": ensure_absolute_path(wt, "Worktree")}
+        {
+            "Id": f"job-{i + 1}",
+            "Client": client_names[i % len(client_names)],
+            "Tab": "fleet" if i < 4 else f"tab-{(i // 4) + 1}",
+            "Directory": ensure_absolute_path(wt, "Worktree"),
+        }
         for i, wt in enumerate(worktrees)
     ]
     manifest: dict[str, Any] = {"DefaultMode": "Jobs", "JobsLayout": layout}
@@ -464,7 +903,7 @@ def update_source(manifest: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def fetch_text(url: str, accept: str = "application/vnd.github+json") -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "AgentFleet/2.0", "Accept": accept})
+    req = urllib.request.Request(url, headers={"User-Agent": "AgentFleet/2.1", "Accept": accept})
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = resp.read(2 * 1024 * 1024 + 1)
         if len(data) > 2 * 1024 * 1024:
@@ -508,10 +947,10 @@ def run_self_update(install_root: Path, manifest: dict[str, Any]) -> dict[str, A
     return {"Result": "updated", "Version": rel["Version"], "SourceCommit": head}
 
 
-def launch_tmux(manifest: dict[str, Any], install_root: Path, job_id: str = "") -> int:
+def launch_tmux(manifest: dict[str, Any], install_root: Path, job_id: str = "", profile: str = "") -> int:
     if not shutil.which("tmux"):
         raise RuntimeError("Agent Fleet on macOS/Linux requires tmux on PATH.")
-    plan = build_launch_plan(manifest, install_root, job_id=job_id)
+    plan = build_launch_plan(manifest, install_root, job_id=job_id, profile=profile)
     for session_plan in plan["Sessions"]:
         session = session_plan["SessionName"]
         if not tmux_has_session(session):
@@ -532,19 +971,48 @@ def launch_tmux(manifest: dict[str, Any], install_root: Path, job_id: str = "") 
     return 0
 
 
+def format_status_watch(snap: dict[str, Any]) -> str:
+    prof = f" [profile: {snap['Profile']}]" if snap.get("Profile") else ""
+    lines = [
+        f"Agent Fleet status{prof} | {snap['Result']} | {time.strftime('%H:%M:%S')}",
+        f"{'TAB':<10} {'JOB':<10} {'CLIENT':<12} {'TMUX':<10} {'BRANCH':<24} {'DIRTY'}",
+    ]
+    for row in snap["Jobs"]:
+        git = row["Git"]
+        branch = git.get("Branch") or "-" if git.get("State") == "observed" else "-"
+        if len(branch) > 23:
+            branch = branch[:20] + "..."
+        dirty = f"{git.get('DirtyCount', '-')}" if git.get("State") == "observed" else "-"
+        lines.append(f"{row['Configured'].get('Tab', 'fleet'):<10} {row['Id']:<10} {row['Configured']['Client']:<12} {row['Session']['State']:<10} {branch:<24} {dirty}")
+    cs = snap.get("ProviderSessions", {}).get("Claude", {})
+    if cs.get("State") == "observed":
+        lines.append(f"Claude sessions: {len(cs.get('Sessions', []))}")
+    return "\n".join(lines)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Agent Fleet cross-platform launcher (macOS/Linux tmux backend)")
-    p.add_argument("--manifest", default=str(default_manifest_path()))
+    p.add_argument("--manifest", default="")
     p.add_argument("--install-root", default=str(default_install_root()))
+    p.add_argument("--profile", default="")
     p.add_argument("--job", default="")
     p.add_argument("--print-plan", action="store_true")
     p.add_argument("--status", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--watch", action="store_true")
+    p.add_argument("--interval", type=int, default=3)
+    p.add_argument("--max-iterations", type=int, default=0)
     p.add_argument("--init", action="store_true")
     p.add_argument("--worktree", action="append", default=[])
     p.add_argument("--layout", choices=("SingleWindow", "JobWindows"), default="SingleWindow")
     p.add_argument("--update-repo", default="")
     p.add_argument("--new-worktree", default="")
+    p.add_argument("--clean-worktree", default="")
+    p.add_argument("--open-tab", action="store_true")
+    p.add_argument("--tab-title", default="")
+    p.add_argument("--allow-worktree-include", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true")
     p.add_argument("--repository", default="")
     p.add_argument("--base-ref", default="main")
     p.add_argument("--branch", default="")
@@ -566,16 +1034,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    manifest_path = Path(args.manifest)
+    if args.watch and not args.status:
+        raise SystemExit("--watch requires --status.")
+    if args.watch and args.json:
+        raise SystemExit("--watch cannot be combined with --json.")
     install_root = Path(args.install_root)
+    profile = validate_profile_name(args.profile)
+    manifest_path = resolve_manifest_path(args.manifest, install_root, profile)
 
     if args.init:
         manifest = init_manifest(manifest_path, args.worktree, layout=args.layout, update_repo=args.update_repo)
         print(json.dumps({"Result": "initialized", "Manifest": str(manifest_path), "Jobs": len(manifest["Jobs"])}, indent=2))
         return 0
+    manifest_ops = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
     if args.new_worktree:
         repo = args.repository or os.getcwd()
-        print(json.dumps(new_worktree(repo, args.new_worktree, base_ref=args.base_ref, branch=args.branch, lock=args.lock), indent=2))
+        print(json.dumps(new_worktree(repo, args.new_worktree, base_ref=args.base_ref, branch=args.branch, lock=args.lock, manifest=manifest_ops, allow_worktree_include=args.allow_worktree_include), indent=2))
+        return 0
+    if args.clean_worktree:
+        base = args.base_ref if "--base-ref" in (argv or sys.argv[1:]) else ""
+        print(json.dumps(clean_worktree(args.clean_worktree, install_root, base_ref=base, dry_run=args.dry_run, force=args.force, manifest_path=manifest_path), indent=2))
         return 0
     if args.rollback:
         target = install_root / "agent_fleet.py"
@@ -587,29 +1065,42 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if args.open_tab:
+        print(json.dumps(open_tab(manifest, install_root, args.client, directory=args.directory, repository=args.repository, branch=args.branch, base_ref=args.base_ref, tab_title=args.tab_title, lock=args.lock, allow_worktree_include=args.allow_worktree_include, profile=profile, manifest_path=manifest_path), indent=2))
+        return 0
     if args.update:
         print(json.dumps(run_self_update(install_root, manifest), indent=2))
         return 0
     if args.dispatch:
-        print(json.dumps(dispatch_task(manifest, install_root, args.client, args.directory, args.prompt, args.model, args.name), indent=2))
+        print(json.dumps(dispatch_task(manifest, install_root, args.client, args.directory, args.prompt, args.model, args.name, profile=profile), indent=2))
         return 0
     if args.queue:
         print(json.dumps(queue_message(manifest, args.thread, args.message, resume=args.resume), indent=2))
         return 0
     if args.print_plan:
-        print(json.dumps(build_launch_plan(manifest, install_root, job_id=args.job), indent=2))
+        print(json.dumps(build_launch_plan(manifest, install_root, job_id=args.job, profile=profile), indent=2))
         return 0
     if args.status:
-        snap = status_snapshot(manifest, install_root, job_id=args.job)
+        if args.watch:
+            count = 0
+            while True:
+                count += 1
+                snap = status_snapshot(manifest, install_root, job_id=args.job, profile=profile)
+                print(format_status_watch(snap))
+                if args.max_iterations > 0 and count >= args.max_iterations:
+                    break
+                time.sleep(max(1, min(60, args.interval)))
+            return 0
+        snap = status_snapshot(manifest, install_root, job_id=args.job, profile=profile)
         if args.json:
             print(json.dumps(snap, indent=2))
         else:
             for row in snap["Jobs"]:
                 git = row["Git"]
                 git_txt = f"{git['Branch']} ({git['DirtyCount']} dirty)" if git["State"] == "observed" else "unavailable"
-                print(f"{row['Id']}: {row['Configured']['Client']} | tmux {row['Session']['State']} | git {git_txt}")
+                print(f"{row['Configured'].get('Tab', 'fleet')} / {row['Id']}: {row['Configured']['Client']} | tmux {row['Session']['State']} | git {git_txt}")
         return 0
-    return launch_tmux(manifest, install_root, job_id=args.job)
+    return launch_tmux(manifest, install_root, job_id=args.job, profile=profile)
 
 
 if __name__ == "__main__":

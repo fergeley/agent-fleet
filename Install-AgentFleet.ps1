@@ -2,6 +2,8 @@
 param(
     [string]$ManifestPath = '',
     [string]$ImportManifest = '',
+    [string]$Profile = '',
+    [switch]$ForceTakeover,
     [switch]$EnableStartup,
     [switch]$Init,
     [string[]]$WorktreeDirectories = @(),
@@ -35,8 +37,11 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit $LASTEXITCODE
 }
 if (-not $IsWindows) { throw 'Agent Fleet requires Windows, PowerShell 7, and Windows Terminal.' }
+if ($Profile -and $Profile -cnotmatch '^[a-z][a-z0-9-]{0,31}$') {
+    throw "The Fleet profile name is invalid (use 1-32 lowercase letters, digits, or hyphens): $Profile"
+}
 if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
-    $ManifestPath = Join-Path $env:LOCALAPPDATA 'AgentFleet/manifest.json'
+    $ManifestPath = if ($Profile) { Join-Path $env:LOCALAPPDATA "AgentFleet/profiles/$Profile/manifest.json" } else { Join-Path $env:LOCALAPPDATA 'AgentFleet/manifest.json' }
 }
 if ($WorktreeDirectories.Count -gt 0) {
     $WorktreeDirectories = @($WorktreeDirectories | ForEach-Object { $_.Split(';', [StringSplitOptions]::RemoveEmptyEntries) })
@@ -200,6 +205,11 @@ if ($Init) {
             $clean[$clientName] = [string]$imported.$clientName
         }
     }
+    foreach ($optField in @('TabColors', 'WorktreeCopyFiles', 'AllowWorktreeInclude')) {
+        if ($imported.PSObject.Properties.Match($optField).Count -gt 0 -and $null -ne $imported.$optField) {
+            $clean[$optField] = $imported.$optField
+        }
+    }
     $clean['Jobs'] = @($imported.Jobs)
     $manifestText = $clean | ConvertTo-Json -Depth 7
 } else {
@@ -229,8 +239,8 @@ foreach ($field in $selectedClients) {
 $commandText = @('@echo off', ('"' + $manifest.PowerShell + '" -NoLogo -NoProfile -File "%LOCALAPPDATA%\AgentFleet\Start-Fleet.ps1" %*'), 'exit /b %ERRORLEVEL%') -join "`r`n"
 $ownCommand = '^@echo off\r\n"[^"]+" -NoLogo -NoProfile -File "%LOCALAPPDATA%\\AgentFleet\\Start-Fleet\.ps1" %\*\r\nexit /b %ERRORLEVEL%$'
 foreach ($target in @($commandPath,$aliasPath)) {
-    if ((Test-Path -LiteralPath $target) -and [IO.File]::ReadAllText($target).TrimEnd() -notmatch $ownCommand) {
-        throw "An unrelated command already exists: $target"
+    if (-not $ForceTakeover -and (Test-Path -LiteralPath $target) -and [IO.File]::ReadAllText($target).TrimEnd() -notmatch $ownCommand) {
+        throw "An unrelated command already exists: $target (pass -ForceTakeover to replace existing launchers)."
     }
 }
 $shell = New-Object -ComObject WScript.Shell
@@ -242,8 +252,8 @@ if ($startupEnabled) { $shortcutTargets += $startupPath }
 foreach ($target in $shortcutTargets) {
     if (Test-Path -LiteralPath $target) {
         $existing = $shell.CreateShortcut($target)
-        if (-not $ownedInstall -or $existing.Arguments -ne $shortcutArguments) {
-            throw "An unrelated shortcut already exists: $target"
+        if (-not $ForceTakeover -and (-not $ownedInstall -or $existing.Arguments -ne $shortcutArguments)) {
+            throw "An unrelated shortcut already exists: $target (pass -ForceTakeover to replace existing shortcuts)."
         }
     }
 }
@@ -274,14 +284,16 @@ if ($previous -and $previous.UpdateProtocol -eq 2 -and $previous.RuntimeDirector
         $receipt.PreviousRuntime = $previous.PreviousRuntime
     }
 }
+$stateTarget = Get-FleetStateDirectory $installRoot $Profile
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 if (-not $ownedInstall) { Write-FleetUpdateJson $receiptPath $receipt }
-New-Item -ItemType Directory -Path (Join-Path $installRoot 'state') -Force | Out-Null
+New-Item -ItemType Directory -Path $stateTarget -Force | Out-Null
 New-Item -ItemType Directory -Path $commandDirectory -Force | Out-Null
 $receipt.RuntimeDirectory = Publish-FleetGeneration -InstallRoot $installRoot -SourceRoot $sourceRoot -Release $release
 foreach ($file in @('FleetUpdate.ps1','Start-Fleet.ps1')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $file) -Destination (Join-Path $installRoot $file) -Force
 }
+$liveManifestPath = Get-FleetManifestPath $installRoot $Profile
 if ($Init -or $ImportManifest) {
     $manifestDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($ManifestPath))
     if (-not [string]::IsNullOrWhiteSpace($manifestDirectory)) {
@@ -289,7 +301,11 @@ if ($Init -or $ImportManifest) {
     }
     [IO.File]::WriteAllText($ManifestPath, $manifestText, [Text.UTF8Encoding]::new($false))
 }
-[IO.File]::WriteAllText((Join-Path $installRoot 'manifest.json'), $manifestText, [Text.UTF8Encoding]::new($false))
+$liveManifestDir = Split-Path -Parent ([IO.Path]::GetFullPath($liveManifestPath))
+if (-not [string]::IsNullOrWhiteSpace($liveManifestDir)) {
+    New-Item -ItemType Directory -Path $liveManifestDir -Force | Out-Null
+}
+[IO.File]::WriteAllText($liveManifestPath, $manifestText, [Text.UTF8Encoding]::new($false))
 Write-FleetUpdateJson $receiptPath $receipt
 foreach ($target in @($commandPath,$aliasPath)) { [IO.File]::WriteAllText($target, ($commandText + "`r`n"), [Text.ASCIIEncoding]::new()) }
 if ($AddToPath) {

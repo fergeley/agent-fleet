@@ -32,10 +32,10 @@ function Get-FleetStatusFileStamp([string[]]$Paths) {
     $stamps.ToArray()
 }
 
-function Get-FleetStatusFileSet([string]$InstallRoot) {
-    $state = Join-Path $InstallRoot 'state'
+function Get-FleetStatusFileSet([string]$InstallRoot, [string]$Profile = '') {
+    $state = Get-FleetStateDirectory $InstallRoot $Profile
     $paths = [Collections.Generic.List[string]]::new()
-    $paths.Add((Join-Path $InstallRoot 'manifest.json'))
+    $paths.Add((Get-FleetManifestPath $InstallRoot $Profile))
     $paths.Add((Join-Path $InstallRoot 'installation.json'))
     $bindings = @(Get-ChildItem -LiteralPath $state -Filter 'job-*.json' -File -ErrorAction Stop | Sort-Object Name)
     $paths.Add("@count|bindings|$($bindings.Count)")
@@ -91,8 +91,8 @@ function Get-FleetStatusShell($Invocation, $Diagnostics, [string]$Path, [bool]$W
     [pscustomobject]$shell
 }
 
-function Get-FleetStatusInvocations($Evidence, [string]$Nonce, [string]$InstallRoot, $Diagnostics, [bool]$WindowAbsent) {
-    $state = Join-Path $InstallRoot 'state'
+function Get-FleetStatusInvocations($Evidence, [string]$Nonce, [string]$StateDirectory, $Diagnostics, [bool]$WindowAbsent) {
+    $state = $StateDirectory
     $files = @(Get-ChildItem -LiteralPath $state -Filter "invocation-$Nonce-*.json" -File | Sort-Object Name)
     if ($files.Count -gt 64) {
         Add-FleetStatusDiagnostic $Diagnostics 'invocations-truncated' 'More than 64 invocation records belong to this launch; the first 64 are shown.' $state
@@ -190,12 +190,13 @@ function Get-FleetStatusWindow($Evidence, $Diagnostics, [string]$Path) {
     }
 }
 
-function Get-FleetStatusBinding($File, [string]$LockHash, [string]$InstallRoot, $Diagnostics) {
+function Get-FleetStatusBinding($File, [string]$LockHash, [string]$InstallRoot, $Diagnostics, [string]$Profile = '') {
+    $state = Get-FleetStateDirectory $InstallRoot $Profile
     try {
-        $evidence = Read-FleetJobEvidence $File.FullName $LockHash $InstallRoot
+        $evidence = Read-FleetJobEvidence $File.FullName $LockHash $InstallRoot $Profile
         $nonce = Get-FleetEvidenceNonce $evidence
         $window = Get-FleetStatusWindow $evidence $Diagnostics $File.FullName
-        $timeoutPath = Join-Path (Join-Path $InstallRoot 'state') "registration-timeout-$nonce.json"
+        $timeoutPath = Join-Path $state "registration-timeout-$nonce.json"
         [pscustomobject]@{
             Id = $evidence.Id; Valid = $true; Path = $File.FullName; Client = $evidence.Client
             Directory = $evidence.Directory; GitDirectory = $evidence.GitDirectory
@@ -203,7 +204,7 @@ function Get-FleetStatusBinding($File, [string]$LockHash, [string]$InstallRoot, 
             WindowNonce = if (Test-FleetProperty $evidence 'WindowNonce') { $evidence.WindowNonce } else { $null }
             LaunchNonce = $nonce; Window = $window
             RegistrationTimedOut = (Test-Path -LiteralPath $timeoutPath -PathType Leaf)
-            Invocations = @(Get-FleetStatusInvocations $evidence $nonce $InstallRoot $Diagnostics ($window.State -ceq 'absent'))
+            Invocations = @(Get-FleetStatusInvocations $evidence $nonce $state $Diagnostics ($window.State -ceq 'absent'))
         }
     } catch {
         Add-FleetStatusDiagnostic $Diagnostics 'binding-invalid' $_.Exception.Message $File.FullName
@@ -211,9 +212,9 @@ function Get-FleetStatusBinding($File, [string]$LockHash, [string]$InstallRoot, 
     }
 }
 
-function Get-FleetStatusCollection([string]$InstallRoot, [string]$LockHash, [string]$JobId = '') {
-    $manifestPath = Join-Path $InstallRoot 'manifest.json'
-    $state = Join-Path $InstallRoot 'state'
+function Get-FleetStatusCollection([string]$InstallRoot, [string]$LockHash, [string]$JobId = '', [string]$Profile = '') {
+    $manifestPath = Get-FleetManifestPath $InstallRoot $Profile
+    $state = Get-FleetStateDirectory $InstallRoot $Profile
     $diagnostics = [Collections.Generic.List[object]]::new()
     $manifest = Read-FleetSharedText $manifestPath | ConvertFrom-Json -ErrorAction Stop
     $ids = @(Get-FleetJobIds $manifest)
@@ -237,7 +238,7 @@ function Get-FleetStatusCollection([string]$InstallRoot, [string]$LockHash, [str
         }
         $fid = $Matches.id
         $kind = $Matches.kind
-        $binding = Get-FleetStatusBinding $file $LockHash $InstallRoot $diagnostics
+        $binding = Get-FleetStatusBinding $file $LockHash $InstallRoot $diagnostics $Profile
         if ($null -eq $binding) { continue }
         if ($binding.Id -cne $fid) {
             Add-FleetStatusDiagnostic $Diagnostics 'binding-id-mismatch' 'The Jobs state file ID differs from its binding.' $file.FullName $fid
@@ -265,11 +266,13 @@ function Get-FleetStatusCollection([string]$InstallRoot, [string]$LockHash, [str
     $rows = [Collections.Generic.List[object]]::new()
     foreach ($id in $selectedIds) {
         $cfg = $configuredById[$id]
+        $tabName = if ((Test-FleetProperty $cfg 'Tab') -and -not [string]::IsNullOrWhiteSpace([string]$cfg.Tab)) { ([string]$cfg.Tab).Trim() } else { 'fleet' }
         $git = Get-FleetGitStatus ([string]$cfg.Directory)
         $rows.Add([pscustomobject]@{
             Id = $id
             Configured = [pscustomobject]@{
                 Client = $cfg.Client
+                Tab = $tabName
                 Directory = $cfg.Directory
             }
             Pending = if ($pendingById.ContainsKey($id)) { $pendingById[$id] } else { $null }
@@ -289,13 +292,13 @@ function Get-FleetStatusCollection([string]$InstallRoot, [string]$LockHash, [str
     }
 }
 
-function Get-FleetLifecycleStatus([string]$InstallRoot, [string]$LockHash, [string]$JobId = '') {
+function Get-FleetLifecycleStatus([string]$InstallRoot, [string]$LockHash, [string]$JobId = '', [string]$Profile = '') {
     $started = [DateTime]::UtcNow.ToString('o')
     $snapshot = $null
     for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $before = Get-FleetStatusFileStamp (Get-FleetStatusFileSet $InstallRoot)
-        $collection = Get-FleetStatusCollection $InstallRoot $LockHash $JobId
-        $after = Get-FleetStatusFileStamp (Get-FleetStatusFileSet $InstallRoot)
+        $before = Get-FleetStatusFileStamp (Get-FleetStatusFileSet $InstallRoot $Profile)
+        $collection = Get-FleetStatusCollection $InstallRoot $LockHash $JobId $Profile
+        $after = Get-FleetStatusFileStamp (Get-FleetStatusFileSet $InstallRoot $Profile)
         $consistent = ($before -join "`n") -ceq ($after -join "`n")
         if ($consistent -or $attempt -eq 2) {
             $finished = [DateTime]::UtcNow.ToString('o')
@@ -334,7 +337,7 @@ function Write-FleetJobState([string]$Path, $Value) {
     }
 }
 
-function Read-FleetJobEvidence([string]$Path, [string]$LockHash, [string]$InstallRoot = $PSScriptRoot) {
+function Read-FleetJobEvidence([string]$Path, [string]$LockHash, [string]$InstallRoot = $PSScriptRoot, [string]$Profile = '') {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "The Jobs state file is missing: $Path" }
     $evidence = Read-FleetSharedText $Path | ConvertFrom-Json -ErrorAction Stop
     foreach ($field in @('Id','Client','Directory','GitDirectory','ObservedHead','NativeExecutable','InstallationTag','Property','InstanceProperty','WindowName','Title','TitleMode','ContextPath')) {
@@ -383,7 +386,7 @@ function Read-FleetJobEvidence([string]$Path, [string]$LockHash, [string]$Instal
         $evidence.ContextPath -cne $expectedContextPath) {
         throw "The Jobs state binding is incomplete or invalid: $Path"
     }
-    $context = Read-FleetLaunchContext $evidence.ContextPath $false $InstallRoot
+    $context = Read-FleetLaunchContext $evidence.ContextPath $false $InstallRoot $Profile
     $contextLayout = if (Test-FleetProperty $context 'Layout') { $context.Layout } else { 'JobWindows' }
     if ($contextLayout -cne $layout -or
         $context.InstallationTag -cne $LockHash -or $context.Nonce -cne $nonce -or
@@ -413,7 +416,7 @@ function Confirm-FleetJobWindow($Evidence, [long]$Window, [string]$StateDirector
     Remove-Item -LiteralPath $pendingPath
 }
 
-function Resolve-FleetPendingWindow($Evidence, [string]$StateDirectory, [string]$LockHash, [string]$InstallRoot) {
+function Resolve-FleetPendingWindow($Evidence, [string]$StateDirectory, [string]$LockHash, [string]$InstallRoot, [string]$Profile = '') {
     $instancePath = Get-FleetJobStatePath $StateDirectory $Evidence.Id 'instance'
     $pendingPath = Get-FleetJobStatePath $StateDirectory $Evidence.Id 'pending'
     $isSingleWindow = (Test-FleetProperty $Evidence 'Layout') -and $Evidence.Layout -ceq 'SingleWindow'
@@ -421,7 +424,7 @@ function Resolve-FleetPendingWindow($Evidence, [string]$StateDirectory, [string]
     $jobWindows = @([FleetWindow]::Find($Evidence.Property))
     $windowPropMatches = if ($isSingleWindow) { @([FleetWindow]::Find($Evidence.WindowProperty)) } else { @() }
     if (Test-Path -LiteralPath $instancePath -PathType Leaf) {
-        $instance = Read-FleetJobEvidence $instancePath $LockHash $InstallRoot
+        $instance = Read-FleetJobEvidence $instancePath $LockHash $InstallRoot $Profile
         if ($instance.Id -cne $Evidence.Id) { throw 'The retained instance file belongs to another job. Inspect it before recovery.' }
         if ($instance.InstanceProperty -ceq $Evidence.InstanceProperty) {
             $instanceLayout = if (Test-FleetProperty $instance 'Layout') { $instance.Layout } else { 'JobWindows' }
@@ -462,7 +465,7 @@ function Resolve-FleetPendingWindow($Evidence, [string]$StateDirectory, [string]
 }
 
 function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [bool]$Arrange,
-    [string]$StateDirectory, [string]$LockHash, [string]$InstallRoot = $PSScriptRoot) {
+    [string]$StateDirectory, [string]$LockHash, [string]$InstallRoot = $PSScriptRoot, [string]$Profile = '') {
     $retainedPending = $ResetPending -and $JobId -cmatch '^[a-z][a-z0-9-]{0,31}$' -and (Test-Path -LiteralPath (Get-FleetJobStatePath $StateDirectory $JobId 'pending') -PathType Leaf)
     $ids = @(try { Get-FleetJobIds $Manifest } catch { if (-not $retainedPending) { throw } })
     if ($JobId -and $JobId -cnotin $ids -and -not $retainedPending) { throw "The Jobs ID is not configured: $JobId" }
@@ -489,7 +492,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
         $fileId = $Matches.id
         $kind = $Matches.kind
         try {
-            $evidence = Read-FleetJobEvidence $file.FullName $LockHash $InstallRoot
+            $evidence = Read-FleetJobEvidence $file.FullName $LockHash $InstallRoot $Profile
             if ($evidence.Id -cne $fileId) { throw 'The Jobs state file ID differs from its binding.' }
             $isEvidenceSingleWindow = (Test-FleetProperty $evidence 'Layout') -and $evidence.Layout -ceq 'SingleWindow'
             if ($kind -eq 'pending') {
@@ -526,8 +529,8 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
             $pendingPath = Get-FleetJobStatePath $StateDirectory $id 'pending'
             if (-not (Test-Path -LiteralPath $pendingPath -PathType Leaf)) { continue }
             try {
-                $evidence = Read-FleetJobEvidence $pendingPath $LockHash $InstallRoot
-                $window = Resolve-FleetPendingWindow $evidence $StateDirectory $LockHash $InstallRoot
+                $evidence = Read-FleetJobEvidence $pendingPath $LockHash $InstallRoot $Profile
+                $window = Resolve-FleetPendingWindow $evidence $StateDirectory $LockHash $InstallRoot $Profile
                 $byId[$id].Window = $window
                 $byId[$id].Result = 'recovered'
                 $byId[$id].Message = 'The exact pending window was recovered.'
@@ -590,7 +593,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
             $byId[$JobId].Message = 'Jobs state or window identity is uncertain. Inspect it before resetting this job.'
         } elseif (Test-Path -LiteralPath $pendingPath) {
             try {
-                $evidence = Read-FleetJobEvidence $pendingPath $LockHash $InstallRoot
+                $evidence = Read-FleetJobEvidence $pendingPath $LockHash $InstallRoot $Profile
                 $matches = @(@([FleetWindow]::FindTitle($evidence.Title)) + $(if ((Test-FleetProperty $evidence 'Layout') -and $evidence.Layout -ceq 'SingleWindow') { @([FleetWindow]::Find($evidence.WindowProperty)) } else { @() }) | Select-Object -Unique)
                 if ($matches.Count -ne 0) {
                     $byId[$JobId].Result = 'blocked'
@@ -664,8 +667,9 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
     }
 
     $layout = Get-FleetJobsLayout $Manifest
+    $tabColors = Get-FleetTabColors $Manifest
     $openFleetPath = Join-Path $PSScriptRoot 'Open-Fleet.ps1'
-    $allPlanned = @(Get-FleetJobs $Manifest $InstallRoot $openFleetPath '')
+    $allPlanned = @(Get-FleetJobs $Manifest $InstallRoot $openFleetPath '' $Profile)
     $byPlannedId = @{}
     foreach ($p in $allPlanned) { $byPlannedId[$p.Id] = $p }
     $toOpen = @($openIds | ForEach-Object { $byPlannedId[$_] })
@@ -674,11 +678,11 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
     if ($layout -ceq 'SingleWindow' -and -not $JobId -and $toOpen.Count -gt 0) {
         $canShareOpen = $existing.Count -eq 0
         if ($canShareOpen) {
-            $plan = New-FleetSingleWindowPlan $Manifest.PowerShell $openFleetPath $InstallRoot $LockHash $toOpen[0].WindowNonce $toOpen
+            $plan = New-FleetSingleWindowPlan $Manifest.PowerShell $openFleetPath $InstallRoot $LockHash $toOpen[0].WindowNonce $toOpen $tabColors $Profile
             foreach ($jobPlan in $toOpen) {
                 $ctx = [ordered]@{
                     Nonce = $jobPlan.Nonce; InstallationTag = $LockHash; Id = $jobPlan.Id; Client = $jobPlan.Client
-                    Directory = $jobPlan.Directory; GitDirectory = $jobPlan.GitDirectory; ObservedHead = $jobPlan.ObservedHead
+                    Tab = $jobPlan.Tab; Directory = $jobPlan.Directory; GitDirectory = $jobPlan.GitDirectory; ObservedHead = $jobPlan.ObservedHead
                     NativeExecutable = $jobPlan.NativeExecutable; NativeArguments = $jobPlan.NativeArguments; NativeEnv = $jobPlan.NativeEnv
                     WindowName = $jobPlan.WindowName; Title = $jobPlan.Title; TitleMode = 'Native'
                     Layout = 'SingleWindow'; WindowNonce = $plan.WindowNonce
@@ -738,7 +742,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
         $title = "Agent Fleet Job [$($jobPlan.Id)] | $($jobPlan.Client) | $LockHash/$($jobPlan.Nonce)"
         $ctx = [ordered]@{
             Nonce = $jobPlan.Nonce; InstallationTag = $LockHash; Id = $jobPlan.Id; Client = $jobPlan.Client
-            Directory = $jobPlan.Directory; GitDirectory = $jobPlan.GitDirectory; ObservedHead = $jobPlan.ObservedHead
+            Tab = $jobPlan.Tab; Directory = $jobPlan.Directory; GitDirectory = $jobPlan.GitDirectory; ObservedHead = $jobPlan.ObservedHead
             NativeExecutable = $jobPlan.NativeExecutable; NativeArguments = $jobPlan.NativeArguments; NativeEnv = $jobPlan.NativeEnv
             WindowName = $windowName; Title = $title; TitleMode = 'Native'; Layout = 'JobWindows'
         }
@@ -750,7 +754,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
             WindowName = $windowName; Title = $title; TitleMode = 'Native'; ContextPath = $jobPlan.ContextPath; Layout = 'JobWindows'
         }
         Write-FleetJobState $jobPlan.StatePath $ev
-        $paneArgs = @('-w', $windowName, 'new-tab') + (New-FleetJobPaneArguments $Manifest.PowerShell $openFleetPath $InstallRoot $jobPlan $jobPlan.ContextPath $title)
+        $paneArgs = @('-w', $windowName, 'new-tab') + (New-FleetJobPaneArguments $Manifest.PowerShell $openFleetPath $InstallRoot $jobPlan $jobPlan.ContextPath $title $Profile $true)
         try {
             [void](Start-Process -FilePath $Manifest.Terminal -ArgumentList $paneArgs)
         } catch {

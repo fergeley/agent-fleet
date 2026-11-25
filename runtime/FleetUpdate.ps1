@@ -5,7 +5,10 @@ function Get-FleetUpdateFiles([int]$Protocol = 2) {
     @('Fleet.ps1', 'FleetJobs.ps1', 'FleetDispatch.ps1', 'FleetWindow.cs', 'FleetSources.ps1', 'Open-Fleet.ps1', 'README.md')
 }
 
-function Get-FleetEntryLockHash([string]$InstallRoot) {
+function Get-FleetEntryLockHash([string]$InstallRoot, [string]$Profile = '') {
+    if ($Profile -and $Profile -cnotmatch '^[a-z][a-z0-9-]{0,31}$') {
+        throw 'The Fleet profile name must match ^[a-z][a-z0-9-]{0,31}$.'
+    }
     if (-not ('FleetStartFolder' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -38,6 +41,7 @@ public static class FleetStartFolder
     }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $installKey = $identity + '|' + [FleetStartFolder]::FinalPath($InstallRoot).ToUpperInvariant()
+    if ($Profile) { $installKey += '|' + $Profile }
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($installKey))).Substring(0, 16)
 }
 

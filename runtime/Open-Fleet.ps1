@@ -8,21 +8,23 @@
     [string]$WindowNonce,
     [string]$LaunchContext,
     [string]$InstallationTag,
+    [string]$Profile = '',
     [psobject]$ManifestSnapshot,
     [int]$RegistrationTimeoutMilliseconds = 60000,
     [string]$InstallRoot = $PSScriptRoot
 )
 
 $ErrorActionPreference = 'Stop'
-$contextPane = $Pane -ne 'None'
-$manifest = if ($contextPane) { $null } elseif ($null -ne $ManifestSnapshot) { $ManifestSnapshot } else { Get-Content -LiteralPath (Join-Path $InstallRoot 'manifest.json') -Raw | ConvertFrom-Json }
 . (Join-Path $PSScriptRoot 'FleetSources.ps1')
+Assert-FleetProfileName $Profile
+$contextPane = $Pane -ne 'None'
+$manifest = if ($contextPane) { $null } elseif ($null -ne $ManifestSnapshot) { $ManifestSnapshot } else { Get-Content -LiteralPath (Get-FleetManifestPath $InstallRoot $Profile) -Raw | ConvertFrom-Json }
 
 if ($Pane -ne 'None') {
     Assert-FleetAbsolutePath $Directory
     if (-not $Job) { throw 'A Jobs pane needs its job ID.' }
     if (-not $LaunchContext) { throw 'A Jobs pane needs its launch context.' }
-    $context = Read-FleetLaunchContext $LaunchContext $true $InstallRoot
+    $context = Read-FleetLaunchContext $LaunchContext $true $InstallRoot $Profile
     if ($context.Id -cne $Job -or $context.Client -cne $Pane -or
         $context.Directory -ne [IO.Path]::TrimEndingDirectorySeparator($Directory)) {
         throw 'The Jobs pane arguments differ from its launch context.'
@@ -32,8 +34,9 @@ if ($Pane -ne 'None') {
         $Host.UI.RawUI.WindowTitle = $context.Title
         if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'FleetWindow.cs') }
         . (Join-Path $PSScriptRoot 'FleetJobs.ps1')
-        [void](Wait-FleetJobRegistration $context $LaunchContext $InstallRoot $RegistrationTimeoutMilliseconds)
-        $Host.UI.RawUI.WindowTitle = "$($context.Client) · $($context.Id)"
+        [void](Wait-FleetJobRegistration $context $LaunchContext $InstallRoot $RegistrationTimeoutMilliseconds $Profile)
+        $tabPrefix = if ((Test-FleetProperty $context 'Tab') -and $context.Tab -and $context.Tab -cne 'fleet') { "$($context.Tab) | " } else { '' }
+        $Host.UI.RawUI.WindowTitle = "$tabPrefix$($context.Client) · $($context.Id)"
     }
     $invocation = $null
     $invocationPath = $null
@@ -41,7 +44,8 @@ if ($Pane -ne 'None') {
     $addedEnv = [Collections.Generic.List[string]]::new()
     try {
         $invocation = New-FleetInvocationRecord $context $LaunchContext $PSScriptRoot
-        $invocationPath = Join-Path (Join-Path $InstallRoot 'state') "invocation-$($context.Nonce)-$($invocation.InvocationId).json"
+        $stateDir = Get-FleetStateDirectory $InstallRoot $Profile
+        $invocationPath = Join-Path $stateDir "invocation-$($context.Nonce)-$($invocation.InvocationId).json"
         Write-FleetInvocationRecord $invocationPath $invocation $false
         if (Test-FleetProperty $context 'NativeArguments') {
             [string[]]$nativeArgs = @($context.NativeArguments)
@@ -73,20 +77,24 @@ if (-not $PrintPlan) {
 
 $layout = Get-FleetJobsLayout $manifest
 $openFleetPath = $PSCommandPath
-$planned = @(Get-FleetJobs $manifest $InstallRoot $openFleetPath $Job)
+$planned = @(Get-FleetJobs $manifest $InstallRoot $openFleetPath $Job $Profile)
+$tabColors = Get-FleetTabColors $manifest
+$lockHash = Get-FleetLaunchLockHash $InstallRoot $Profile
 if ($layout -ceq 'SingleWindow' -and -not $Job) {
-    $single = New-FleetSingleWindowPlan $manifest.PowerShell $openFleetPath $InstallRoot (Get-FleetLaunchLockHash $InstallRoot) $planned[0].WindowNonce $planned
+    $single = New-FleetSingleWindowPlan $manifest.PowerShell $openFleetPath $InstallRoot $lockHash $planned[0].WindowNonce $planned $tabColors $Profile
     [pscustomobject]@{
         Mode = 'Jobs'
         Layout = 'SingleWindow'
+        Profile = if ($Profile) { $Profile } else { $null }
         Windows = @($single)
-    } | ConvertTo-Json -Depth 8
+    } | ConvertTo-Json -Depth 9
 } else {
     $windows = foreach ($jobPlan in $planned) {
-        $paneArgs = @('-w', $jobPlan.WindowName, 'new-tab') + (New-FleetJobPaneArguments $manifest.PowerShell $openFleetPath $InstallRoot $jobPlan $jobPlan.ContextPath $jobPlan.Title)
+        $paneArgs = @('-w', $jobPlan.WindowName, 'new-tab') + (New-FleetJobPaneArguments $manifest.PowerShell $openFleetPath $InstallRoot $jobPlan $jobPlan.ContextPath $jobPlan.Title $Profile $true)
         [pscustomobject]@{
             Id = $jobPlan.Id
             Client = $jobPlan.Client
+            Tab = $jobPlan.Tab
             Directory = $jobPlan.Directory
             WindowName = $jobPlan.WindowName
             Title = $jobPlan.Title
@@ -98,6 +106,7 @@ if ($layout -ceq 'SingleWindow' -and -not $Job) {
     [pscustomobject]@{
         Mode = 'Jobs'
         Layout = $layout
+        Profile = if ($Profile) { $Profile } else { $null }
         Windows = @($windows)
-    } | ConvertTo-Json -Depth 8
+    } | ConvertTo-Json -Depth 9
 }

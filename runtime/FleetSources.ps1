@@ -10,6 +10,29 @@ function Assert-FleetAbsolutePath([string]$Path) {
     }
 }
 
+function Assert-FleetProfileName([string]$Profile) {
+    if ([string]::IsNullOrWhiteSpace($Profile)) { return }
+    if ($Profile -cnotmatch '^[a-z][a-z0-9-]{0,31}$') {
+        throw "The Fleet profile name is invalid (use 1-32 lowercase letters, digits, or hyphens): $Profile"
+    }
+}
+
+function Get-FleetManifestPath([string]$InstallRoot, [string]$Profile = '') {
+    Assert-FleetProfileName $Profile
+    if ([string]::IsNullOrWhiteSpace($Profile)) {
+        return (Join-Path $InstallRoot 'manifest.json')
+    }
+    return (Join-Path (Join-Path (Join-Path $InstallRoot 'profiles') $Profile) 'manifest.json')
+}
+
+function Get-FleetStateDirectory([string]$InstallRoot, [string]$Profile = '') {
+    Assert-FleetProfileName $Profile
+    if ([string]::IsNullOrWhiteSpace($Profile)) {
+        return (Join-Path $InstallRoot 'state')
+    }
+    return (Join-Path (Join-Path (Join-Path $InstallRoot 'profiles') $Profile) 'state')
+}
+
 function Get-FleetFinalDirectoryPath([string]$Path) {
     Assert-FleetAbsolutePath $Path
     if (-not ('FleetPath' -as [type])) {
@@ -54,9 +77,11 @@ public static class FleetPath
     return $full
 }
 
-function Get-FleetLaunchLockHash([string]$InstallRoot) {
+function Get-FleetLaunchLockHash([string]$InstallRoot, [string]$Profile = '') {
+    Assert-FleetProfileName $Profile
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $installKey = $identity + '|' + (Get-FleetFinalDirectoryPath $InstallRoot).ToUpperInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) { $installKey += '|' + $Profile }
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($installKey))).Substring(0, 16)
 }
 
@@ -114,10 +139,44 @@ function Assert-FleetDistinctWorktrees([string[]]$Worktrees, [int]$ExpectedCount
     [pscustomobject]@{ Worktrees = $resolved.ToArray(); GitDirectories = @($seen); Heads = $heads.ToArray() }
 }
 
+function Test-FleetProperty($Object, [string]$Name) {
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [Collections.IDictionary]) { return $Object.Contains($Name) }
+    $Object.PSObject.Properties.Match($Name).Count -gt 0
+}
+
+function Get-FleetTabColors($Manifest) {
+    $colors = [ordered]@{}
+    if (-not (Test-FleetProperty $Manifest 'TabColors') -or $null -eq $Manifest.TabColors) {
+        return $colors
+    }
+    $raw = $Manifest.TabColors
+    if ($raw -is [string] -or $raw -is [Array]) {
+        throw 'The TabColors manifest field must be an object mapping tab names to #RRGGBB hex colors.'
+    }
+    $pairs = if ($raw -is [Collections.IDictionary]) {
+        $raw.GetEnumerator()
+    } else {
+        @($raw.PSObject.Properties | ForEach-Object { [Collections.DictionaryEntry]::new($_.Name, $_.Value) })
+    }
+    foreach ($pair in $pairs) {
+        $tab = [string]$pair.Key
+        $val = $pair.Value
+        if ($tab -cnotmatch '^[a-z0-9][a-z0-9 _-]{0,31}$') {
+            throw "The TabColors tab name is invalid: $tab"
+        }
+        if ($val -isnot [string] -or $val -cnotmatch '^#[0-9A-Fa-f]{6}$') {
+            throw "The TabColors value must be a #RRGGBB hex color for tab $tab."
+        }
+        $colors[$tab] = $val
+    }
+    return $colors
+}
+
 function Get-FleetJobIds($Manifest) {
-    if ($null -eq $Manifest.Jobs) { throw 'Configure one to four Jobs entries in the manifest.' }
+    if ($null -eq $Manifest.Jobs) { throw 'Configure 1 to 16 Jobs entries in the manifest.' }
     $entries = @($Manifest.Jobs)
-    if ($entries.Count -lt 1 -or $entries.Count -gt 4) { throw 'Configure one to four Jobs entries.' }
+    if ($entries.Count -lt 1 -or $entries.Count -gt 16) { throw 'Configure 1 to 16 Jobs entries.' }
     $ids = [Collections.Generic.List[string]]::new()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in $entries) {
@@ -182,10 +241,39 @@ function Parse-FleetJobEnv($Entry, [string]$Id) {
     return $parsed
 }
 
+function Parse-FleetJobTab($Entry, [string]$Id) {
+    if (-not (Test-FleetProperty $Entry 'Tab') -or $null -eq $Entry.Tab) { return 'fleet' }
+    if ($Entry.Tab -isnot [string] -or [string]::IsNullOrWhiteSpace($Entry.Tab)) {
+        throw "The Jobs Tab field must be a non-empty string for $Id."
+    }
+    $tab = $Entry.Tab.Trim()
+    if ($tab -cnotmatch '^[a-z0-9][a-z0-9 _-]{0,31}$') {
+        throw "The Jobs Tab name is invalid for $Id (use 1-32 letters, digits, spaces, _ or -): $tab"
+    }
+    return $tab
+}
+
 function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
     $ids = @(Get-FleetJobIds $Manifest)
     $entries = @($Manifest.Jobs)
     if ($JobId -and $JobId -cnotin $ids) { throw "The Jobs ID is not configured: $JobId" }
+    $layout = Get-FleetJobsLayout $Manifest
+    [void](Get-FleetTabColors $Manifest)
+
+    # Validate full-manifest tab limits even when a single -Job filter is active.
+    $tabCounts = [ordered]@{}
+    foreach ($entry in $entries) {
+        $tabName = Parse-FleetJobTab $entry $entry.Id
+        if (-not $tabCounts.Contains($tabName)) { $tabCounts[$tabName] = 0 }
+        $tabCounts[$tabName]++
+        if ($tabCounts[$tabName] -gt 4) {
+            throw "Tab '$tabName' exceeds the limit of 4 panes per tab."
+        }
+    }
+    if ($tabCounts.Count -gt 4) {
+        throw "Configure at most 4 distinct tabs in SingleWindow (found $($tabCounts.Count))."
+    }
+
     $selected = [Collections.Generic.List[object]]::new()
     foreach ($entry in $entries) {
         if ($JobId -and $entry.Id -cne $JobId) { continue }
@@ -193,11 +281,16 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
             throw "The Jobs client is unsupported: $($entry.Client)"
         }
         if ($entry.Directory -isnot [string]) { throw "The Jobs directory is missing for $($entry.Id)." }
+        if ($layout -ceq 'SingleWindow' -and $entry.Directory.Contains(';')) {
+            throw "SingleWindow job directory cannot contain a semicolon: $($entry.Directory)"
+        }
+        $tabName = Parse-FleetJobTab $entry $entry.Id
         $customArgs = Parse-FleetJobArgs $entry $entry.Id
         $customEnv = Parse-FleetJobEnv $entry $entry.Id
         $selected.Add([pscustomobject]@{
             Id = $entry.Id
             Client = $entry.Client
+            Tab = $tabName
             Directory = [IO.Path]::TrimEndingDirectorySeparator($entry.Directory)
             NativeArguments = Get-FleetClientArguments $entry.Client $customArgs
             NativeEnv = $customEnv
@@ -215,6 +308,7 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
         $resolved.Add([pscustomobject]@{
             Id = $entry.Id
             Client = $entry.Client
+            Tab = $entry.Tab
             Directory = $verified.Worktrees[$index]
             GitDirectory = $gitDirs[$index]
             ObservedHead = $verified.Heads[$index]
@@ -223,12 +317,6 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
         })
     }
     return $resolved.ToArray()
-}
-
-function Test-FleetProperty($Object, [string]$Name) {
-    if ($null -eq $Object) { return $false }
-    if ($Object -is [Collections.IDictionary]) { return $Object.Contains($Name) }
-    $Object.PSObject.Properties.Match($Name).Count -gt 0
 }
 
 function Get-FleetJobsLayout($Manifest) {
@@ -258,64 +346,113 @@ function Get-FleetEvidenceNonce($Evidence) {
     $null
 }
 
-function Get-FleetJobArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath) {
-    @(
+function Get-FleetJobArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath, [string]$Profile = '') {
+    $argsList = [Collections.Generic.List[string]]::new()
+    $argsList.AddRange([string[]]@(
         '-NoLogo', '-NoExit', '-File', $OpenFleetPath,
-        '-Mode', 'Jobs', '-Job', $Job.Id, '-Pane', $Job.Client,
+        '-Job', $Job.Id, '-Pane', $Job.Client,
         '-Directory', $Job.Directory, '-LaunchContext', $ContextPath,
         '-InstallRoot', $InstallRoot
-    )
+    ))
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+        $argsList.AddRange([string[]]@('-Profile', $Profile))
+    }
+    return $argsList.ToArray()
 }
 
-function New-FleetJobPaneArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath, [string]$Title) {
-    @('--title', $Title, '--suppressApplicationTitle', '-d', $Job.Directory, $PowerShellExecutable) +
-        (Get-FleetJobArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $Job $ContextPath)
+function New-FleetJobPaneArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath, [string]$Title, [string]$Profile = '', [bool]$UseApplicationTitle = $true) {
+    $titleFlag = if ($UseApplicationTitle) { '--useApplicationTitle' } else { '--suppressApplicationTitle' }
+    @('--title', $Title, $titleFlag, '-d', $Job.Directory, $PowerShellExecutable) +
+        (Get-FleetJobArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $Job $ContextPath $Profile)
 }
 
-function New-FleetSingleWindowPlan([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, [string]$LockHash, [string]$WindowNonce, [object[]]$JobPlans) {
-    if ($JobPlans.Count -lt 1 -or $JobPlans.Count -gt 4) { throw 'Configure one to four Jobs entries for a single window.' }
+function New-FleetSingleWindowPlan([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, [string]$LockHash, [string]$WindowNonce, [object[]]$JobPlans, $TabColors = @{}, [string]$Profile = '') {
+    if ($JobPlans.Count -lt 1 -or $JobPlans.Count -gt 16) { throw 'Configure 1 to 16 Jobs entries for SingleWindow.' }
     $windowName = "AgentFleetJobs-$LockHash-$WindowNonce"
     $title = "Agent Fleet Jobs | $LockHash/$WindowNonce"
     $windowProperty = Get-FleetWindowProperty $LockHash $WindowNonce
-    $terminalArgs = [Collections.Generic.List[string]]::new()
-    $terminalArgs.AddRange([string[]]@('-w', $windowName, 'new-tab'))
-    $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[0] $JobPlans[0].ContextPath $title))
-    if ($JobPlans.Count -eq 2) {
-        $terminalArgs.Add(';')
-        $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[1] $JobPlans[1].ContextPath $title))
-    } elseif ($JobPlans.Count -eq 3) {
-        $terminalArgs.Add(';')
-        $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[1] $JobPlans[1].ContextPath $title))
-        $terminalArgs.AddRange([string[]]@(';', 'move-focus', 'left', ';', 'split-pane', '-H'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[2] $JobPlans[2].ContextPath $title))
-    } elseif ($JobPlans.Count -eq 4) {
-        $terminalArgs.Add(';')
-        $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[1] $JobPlans[1].ContextPath $title))
-        $terminalArgs.Add(';')
-        $terminalArgs.AddRange([string[]]@('split-pane', '-H'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[3] $JobPlans[3].ContextPath $title))
-        $terminalArgs.AddRange([string[]]@(';', 'move-focus', 'left', ';', 'split-pane', '-H'))
-        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $JobPlans[2] $JobPlans[2].ContextPath $title))
+
+    $tabGroups = [ordered]@{}
+    foreach ($jp in $JobPlans) {
+        $tName = if ((Test-FleetProperty $jp 'Tab') -and -not [string]::IsNullOrWhiteSpace([string]$jp.Tab)) { [string]$jp.Tab } else { 'fleet' }
+        if (-not $tabGroups.Contains($tName)) { $tabGroups[$tName] = [Collections.Generic.List[object]]::new() }
+        $tabGroups[$tName].Add($jp)
     }
+    if ($tabGroups.Count -gt 4) { throw 'Configure at most 4 tabs for SingleWindow.' }
+
+    $terminalArgs = [Collections.Generic.List[string]]::new()
+    $tabSummaries = [Collections.Generic.List[object]]::new()
+    $tabIndex = 0
+    foreach ($entry in $tabGroups.GetEnumerator()) {
+        $tabName = [string]$entry.Key
+        $tabJobs = @($entry.Value.ToArray())
+        if ($tabJobs.Count -lt 1 -or $tabJobs.Count -gt 4) {
+            throw "Tab '$tabName' must contain 1 to 4 panes."
+        }
+        $tabColor = ''
+        if ($TabColors -is [Collections.IDictionary] -and $TabColors.Contains($tabName)) {
+            $tabColor = [string]$TabColors[$tabName]
+        } elseif ($null -ne $TabColors -and (Test-FleetProperty $TabColors $tabName)) {
+            $tabColor = [string]$TabColors.$tabName
+        }
+
+        if ($tabIndex -eq 0) {
+            $terminalArgs.AddRange([string[]]@('-w', $windowName, '--maximized', 'new-tab'))
+        } else {
+            $terminalArgs.Add(';')
+            $terminalArgs.Add('new-tab')
+        }
+        if ($tabColor) {
+            $terminalArgs.AddRange([string[]]@('--tabColor', $tabColor))
+        }
+        $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[0] $tabJobs[0].ContextPath $title $Profile $true))
+
+        if ($tabJobs.Count -eq 2) {
+            $terminalArgs.Add(';')
+            $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[1] $tabJobs[1].ContextPath $title $Profile $true))
+        } elseif ($tabJobs.Count -eq 3) {
+            $terminalArgs.Add(';')
+            $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[1] $tabJobs[1].ContextPath $title $Profile $true))
+            $terminalArgs.AddRange([string[]]@(';', 'move-focus', 'left', ';', 'split-pane', '-H'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[2] $tabJobs[2].ContextPath $title $Profile $true))
+        } elseif ($tabJobs.Count -eq 4) {
+            $terminalArgs.Add(';')
+            $terminalArgs.AddRange([string[]]@('split-pane', '-V'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[1] $tabJobs[1].ContextPath $title $Profile $true))
+            $terminalArgs.Add(';')
+            $terminalArgs.AddRange([string[]]@('split-pane', '-H'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[3] $tabJobs[3].ContextPath $title $Profile $true))
+            $terminalArgs.AddRange([string[]]@(';', 'move-focus', 'left', ';', 'split-pane', '-H'))
+            $terminalArgs.AddRange([string[]](New-FleetJobPaneArguments $PowerShellExecutable $OpenFleetPath $InstallRoot $tabJobs[2] $tabJobs[2].ContextPath $title $Profile $true))
+        }
+
+        $tabSummaries.Add([pscustomobject]@{
+            Tab = $tabName
+            Color = if ($tabColor) { $tabColor } else { $null }
+            JobIds = @($tabJobs | ForEach-Object Id)
+        })
+        $tabIndex++
+    }
+
     [pscustomobject]@{
         Layout = 'SingleWindow'
         WindowName = $windowName
         Title = $title
         WindowProperty = $windowProperty
         WindowNonce = $WindowNonce
+        Tabs = $tabSummaries.ToArray()
         Arguments = $terminalArgs.ToArray()
         Jobs = @($JobPlans)
     }
 }
 
-function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]$OpenFleetPath = (Join-Path $PSScriptRoot 'Open-Fleet.ps1'), [string]$JobId = '') {
+function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]$OpenFleetPath = (Join-Path $PSScriptRoot 'Open-Fleet.ps1'), [string]$JobId = '', [string]$Profile = '') {
     $definitions = @(Get-FleetJobDefinitions $Manifest $JobId)
     $layout = Get-FleetJobsLayout $Manifest
-    $lockHash = Get-FleetLaunchLockHash $InstallRoot
-    $stateDirectory = Join-Path $InstallRoot 'state'
+    $lockHash = Get-FleetLaunchLockHash $InstallRoot $Profile
+    $stateDirectory = Get-FleetStateDirectory $InstallRoot $Profile
     $singleWindowNonce = if ($layout -ceq 'SingleWindow') { [Guid]::NewGuid().ToString('n') } else { '' }
     $windowName = if ($layout -ceq 'SingleWindow') { "AgentFleetJobs-$lockHash-$singleWindowNonce" } else { '' }
     $windowTitle = if ($layout -ceq 'SingleWindow') { "Agent Fleet Jobs | $lockHash/$singleWindowNonce" } else { '' }
@@ -339,6 +476,7 @@ function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]
         $item = [ordered]@{
             Id = $entry.Id
             Client = $entry.Client
+            Tab = $entry.Tab
             Directory = $entry.Directory
             GitDirectory = $entry.GitDirectory
             ObservedHead = $entry.ObservedHead
@@ -357,6 +495,7 @@ function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]
             InstancePath = Join-Path $stateDirectory "job-$($entry.Id).instance.json"
             Layout = $layout
         }
+        if ($Profile) { $item.Profile = $Profile }
         if ($layout -ceq 'SingleWindow') {
             $item.WindowNonce = $singleWindowNonce
             $item.WindowProperty = $windowProperty
@@ -366,10 +505,10 @@ function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]
     return $jobs.ToArray()
 }
 
-function Read-FleetLaunchContext([string]$Path, [bool]$AllowCustomArgsAndEnv = $false, [string]$InstallRoot = $PSScriptRoot) {
+function Read-FleetLaunchContext([string]$Path, [bool]$AllowCustomArgsAndEnv = $false, [string]$InstallRoot = $PSScriptRoot, [string]$Profile = '') {
     Assert-FleetAbsolutePath $Path
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "The launch context is missing: $Path" }
-    $expectedDir = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'state')).TrimEnd('\')
+    $expectedDir = [IO.Path]::GetFullPath((Get-FleetStateDirectory $InstallRoot $Profile)).TrimEnd('\')
     $actualDir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path)).TrimEnd('\')
     if ($actualDir -ine $expectedDir) { throw "The launch context is outside the install state directory: $Path" }
     $context = Read-FleetSharedText $Path | ConvertFrom-Json -ErrorAction Stop
@@ -384,6 +523,11 @@ function Read-FleetLaunchContext([string]$Path, [bool]$AllowCustomArgsAndEnv = $
     Assert-FleetAbsolutePath $context.Directory
     Assert-FleetAbsolutePath $context.GitDirectory
     Assert-FleetAbsolutePath $context.NativeExecutable
+    if (Test-FleetProperty $context 'Tab' -and $null -ne $context.Tab) {
+        if ($context.Tab -isnot [string] -or $context.Tab -cnotmatch '^[a-z0-9][a-z0-9 _-]{0,31}$') {
+            throw 'The launch context Tab field is invalid.'
+        }
+    }
     if (Test-FleetProperty $context 'NativeArguments') {
         if ($null -eq $context.NativeArguments -or $context.NativeArguments -is [string] -or $context.NativeArguments -isnot [Array]) {
             throw 'The launch context NativeArguments field is invalid.'
@@ -417,8 +561,8 @@ function Read-FleetLaunchContext([string]$Path, [bool]$AllowCustomArgsAndEnv = $
     $context
 }
 
-function Wait-FleetJobRegistration($Context, [string]$ContextPath, [string]$InstallRoot, [int]$TimeoutMilliseconds = 60000) {
-    $stateDirectory = Join-Path $InstallRoot 'state'
+function Wait-FleetJobRegistration($Context, [string]$ContextPath, [string]$InstallRoot, [int]$TimeoutMilliseconds = 60000, [string]$Profile = '') {
+    $stateDirectory = Get-FleetStateDirectory $InstallRoot $Profile
     $pendingPath = Join-Path $stateDirectory "job-$($Context.Id).pending.json"
     $instancePath = Join-Path $stateDirectory "job-$($Context.Id).instance.json"
     $isSingleWindow = (Test-FleetProperty $Context 'Layout') -and $Context.Layout -ceq 'SingleWindow'

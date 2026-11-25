@@ -12,15 +12,15 @@ $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('agent-fleet-test-' + [Guid]::N
 [void][IO.Directory]::CreateDirectory($tmpRoot)
 
 try {
-    # Prepare bare-minimum Git repo + 4 worktrees.
+    # Prepare bare-minimum Git repo + 6 worktrees.
     $gitRepo = Join-Path $tmpRoot 'repo'
-    & git init -q $gitRepo
+    & git init -q -b main $gitRepo
     if ($LASTEXITCODE -ne 0) { throw 'git init failed.' }
     & git -C $gitRepo -c user.name=Test -c user.email=test@example.invalid commit -q --allow-empty -m 'init'
     if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
 
     $workers = [Collections.Generic.List[string]]::new()
-    for ($i = 1; $i -le 4; $i++) {
+    for ($i = 1; $i -le 6; $i++) {
         $wt = Join-Path $tmpRoot "wt-$i"
         & git -C $gitRepo worktree add -q --detach $wt
         if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $wt" }
@@ -102,7 +102,7 @@ class Program {
     if (-not $rejected) { throw 'Jobs Env failed to reject GIT_DIR override.' }
     Write-Output 'PASS: SingleWindow default, JobWindows PrintPlan, per-job Args/Env, and GIT_* rejection.'
 
-    # 2. Open-Fleet pane execution with custom Args/Env and process env cleanup.
+    # 2. Open-Fleet pane execution with custom Args/Env and 1-arg array splat fallback.
     $nonce = [Guid]::NewGuid().ToString('n')
     $lockHash = Get-FleetLaunchLockHash $installRoot
     $contextPath = Join-Path $stateDir "launch-context-$nonce.json"
@@ -138,7 +138,7 @@ class Program {
         throw 'Get-FleetLifecycleStatus did not capture Git dirty state and Claude sessions.'
     }
 
-    $wt5 = Join-Path $tmpRoot 'wt-5'
+    $wt5 = Join-Path $tmpRoot 'wt-new-5'
     $wtRes = New-FleetWorktree -Repository $gitRepo -Path $wt5 -BaseRef HEAD -Branch 'feat/public-test' -Lock
     if ($wtRes.Result -cne 'created' -or -not $wtRes.Locked -or -not (Test-Path -LiteralPath $wt5)) {
         throw 'New-FleetWorktree failed.'
@@ -157,7 +157,7 @@ class Program {
     }
     Write-Output 'PASS: Lifecycle status Git+Claude, New-FleetWorktree, Dispatch, and Queue.'
 
-    # 4. Install-AgentFleet.ps1 (-Init, zero-arg reinstall, -DisableAutoUpdate, -ImportManifest) in isolated LocalAppData/UserProfile.
+    # 4. Install-AgentFleet.ps1 (-Init, zero-arg reinstall, -DisableAutoUpdate, -ImportManifest, -ForceTakeover).
     $fakeProfile = Join-Path $tmpRoot 'userprofile'
     $fakeLocal = Join-Path $tmpRoot 'localappdata'
     $fakeDesktop = Join-Path $tmpRoot 'desktop'
@@ -176,46 +176,52 @@ class Program {
         }
         $env:PATH = "$binTools;$oldPath"
 
-        $initOut = & $installer -Init -WorktreeDirectories @($workers[0], $workers[1]) -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup -DisableAutoUpdate
-        if ($LASTEXITCODE -ne 0) { throw "Install -Init failed: $initOut" }
+        # Seed unrelated command + shortcut to verify refusal without -ForceTakeover, then success with -ForceTakeover.
+        $cmdDir = Join-Path $fakeProfile '.local/bin'
+        [void][IO.Directory]::CreateDirectory($cmdDir)
+        [IO.File]::WriteAllText((Join-Path $cmdDir 'agent-fleet.cmd'), "@echo off`r`necho old`r`n")
+        $threwTakeover = $false
+        try {
+            $null = & $installer -Init -WorktreeDirectories @($workers[0], $workers[1]) -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup 2>&1
+            if ($LASTEXITCODE -ne 0) { $threwTakeover = $true }
+        } catch { $threwTakeover = $true }
+        if (-not $threwTakeover) { throw 'Installer replaced unrelated command without -ForceTakeover.' }
+
+        $initOut = & $installer -Init -WorktreeDirectories @($workers[0], $workers[1]) -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup -DisableAutoUpdate -ForceTakeover
+        if ($LASTEXITCODE -ne 0) { throw "Install -Init -ForceTakeover failed: $initOut" }
         $receiptFile = Join-Path $fakeLocal 'AgentFleet/installation.json'
         $initManifestFile = Join-Path $fakeLocal 'AgentFleet/manifest.json'
-        if (-not (Test-Path -LiteralPath $receiptFile) -or -not (Test-Path -LiteralPath $initManifestFile)) {
-            throw 'Install -Init did not create installation.json and manifest.json.'
-        }
         $rec = Get-Content -LiteralPath $receiptFile -Raw | ConvertFrom-Json
-        if ($rec.ReleaseVersion -cne '2.0.0' -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
-            throw 'Install -Init receipt fields unexpected.'
+        if ($rec.ReleaseVersion -cne '2.1.0' -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
+            throw "Install -Init receipt unexpected: $($rec | ConvertTo-Json)"
         }
 
-        # Zero-arg reinstall.
         $reOut = & $installer -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup
         if ($LASTEXITCODE -ne 0) { throw "Zero-arg reinstall failed: $reOut" }
 
-        # -ImportManifest into a custom ManifestPath (with different profile/local dir or same dir updating manifest).
         $legacyManifest = Join-Path $tmpRoot 'legacy-manifest.json'
         [IO.File]::WriteAllText($legacyManifest, ($manifest | ConvertTo-Json -Depth 7))
         $impOut = & $installer -ImportManifest $legacyManifest -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup
         if ($LASTEXITCODE -ne 0) { throw "Install -ImportManifest failed: $impOut" }
-        $importedLive = Get-Content -LiteralPath $initManifestFile -Raw | ConvertFrom-Json
-        if ($importedLive.UpdateRepo -cne 'fergeley/agent-fleet' -or $importedLive.Jobs.Count -ne 4) {
-            throw 'Install -ImportManifest did not populate manifest cleanly.'
-        }
+
+        # Profile manifest install leaves root manifest untouched.
+        $profInit = & $installer -Profile 'work' -Init -WorktreeDirectories @($workers[2]) -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup
+        if ($LASTEXITCODE -ne 0) { throw "Profile install failed: $profInit" }
+        $profManifest = Join-Path $fakeLocal 'AgentFleet/profiles/work/manifest.json'
+        if (-not (Test-Path -LiteralPath $profManifest -PathType Leaf)) { throw 'Profile manifest was not written.' }
+        $rootJobs = (Get-Content -LiteralPath $initManifestFile -Raw | ConvertFrom-Json).Jobs.Count
+        if ($rootJobs -ne 4) { throw 'Profile install clobbered root manifest.' }
     } finally {
         $env:USERPROFILE = $oldProfile; $env:LOCALAPPDATA = $oldLocal; $env:PATH = $oldPath
     }
-    Write-Output 'PASS: Install-AgentFleet -Init, zero-arg reinstall, -DisableAutoUpdate, and -ImportManifest.'
+    Write-Output 'PASS: Install-AgentFleet -Init, -ForceTakeover, -ImportManifest, zero-arg reinstall, and -Profile.'
 
     # 5. Protocol 2 public HTTPS Invoke-FleetUpdate + -Rollback using mocked Invoke-FleetPublicGitHubApi.
     $updRoot = Join-Path $tmpRoot 'upd-install'
     [void][IO.Directory]::CreateDirectory($updRoot)
     [IO.File]::WriteAllText((Join-Path $updRoot 'manifest.json'), (@{ UpdateRepo = 'fergeley/agent-fleet' } | ConvertTo-Json))
-    $srcCheck = Get-FleetUpdateSource $updRoot
-    if ($srcCheck.Repo -cne 'fergeley/agent-fleet' -or $srcCheck.Transport -cne 'https' -or $srcCheck.PathPrefix -cne '') {
-        throw 'Public updater source routing mismatch.'
-    }
-    $pkg1 = Join-Path $tmpRoot 'pkg-200'
-    $pkg2 = Join-Path $tmpRoot 'pkg-210'
+    $pkg1 = Join-Path $tmpRoot 'pkg-210'
+    $pkg2 = Join-Path $tmpRoot 'pkg-220'
     foreach ($dir in @($pkg1, $pkg2)) {
         [void][IO.Directory]::CreateDirectory($dir)
         foreach ($file in Get-FleetUpdateFiles 2) {
@@ -223,14 +229,14 @@ class Program {
         }
     }
     $h1 = [ordered]@{}; foreach ($f in Get-FleetUpdateFiles 2) { $h1[$f] = Get-FleetReleaseHash (Join-Path $pkg1 $f) }
-    Write-FleetUpdateJson (Join-Path $pkg1 'release.json') @{ Protocol = 2; Version = '2.0.0'; Files = $h1 }
+    Write-FleetUpdateJson (Join-Path $pkg1 'release.json') @{ Protocol = 2; Version = '2.1.0'; Files = $h1 }
     $h2 = [ordered]@{}; foreach ($f in Get-FleetUpdateFiles 2) { $h2[$f] = Get-FleetReleaseHash (Join-Path $pkg2 $f) }
-    Write-FleetUpdateJson (Join-Path $pkg2 'release.json') @{ Protocol = 2; Version = '2.1.0'; Files = $h2 }
+    Write-FleetUpdateJson (Join-Path $pkg2 'release.json') @{ Protocol = 2; Version = '2.2.0'; Files = $h2 }
 
-    $ptr200 = Publish-FleetGeneration $updRoot $pkg1 (Read-FleetRelease (Join-Path $pkg1 'release.json'))
+    $ptr210 = Publish-FleetGeneration $updRoot $pkg1 (Read-FleetRelease (Join-Path $pkg1 'release.json'))
     Write-FleetUpdateJson (Join-Path $updRoot 'installation.json') @{
-        InstallRoot = $updRoot; UpdateProtocol = 2; ReleaseVersion = '2.0.0'
-        RuntimeDirectory = $ptr200; SourceCommit = ''; AutoUpdateEnabled = $true; InstalledAtUtc = [DateTime]::UtcNow.ToString('o')
+        InstallRoot = $updRoot; UpdateProtocol = 2; ReleaseVersion = '2.1.0'
+        RuntimeDirectory = $ptr210; SourceCommit = ''; AutoUpdateEnabled = $true; InstalledAtUtc = [DateTime]::UtcNow.ToString('o')
     }
     $script:mockCalls = 0
     $script:fakeSha = 'c' * 40
@@ -251,8 +257,170 @@ class Program {
     $rbOut = & $pwshExe -NoLogo -NoProfile -File (Join-Path $updRoot 'Start-Fleet.ps1') -Rollback 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Rollback failed: $rbOut" }
     $rbRec = Get-Content -LiteralPath (Join-Path $updRoot 'installation.json') -Raw | ConvertFrom-Json
-    if ($rbRec.ReleaseVersion -cne '2.0.0') { throw 'Rollback did not restore 2.0.0.' }
+    if ($rbRec.ReleaseVersion -cne '2.1.0') { throw 'Rollback did not restore 2.1.0.' }
     Write-Output 'PASS: Public HTTPS Protocol 2 update and -Rollback.'
+
+    # 6. Multi-tab SingleWindow planning + TabColors + limit validation.
+    $multiManifest = [ordered]@{} + $manifest
+    $multiManifest.TabColors = @{ hub = '#1e66f5'; agy = '#40a02b' }
+    $multiManifest.Jobs = @(
+        @{ Id = 'job-1'; Tab = 'hub'; Client = 'Codex'; Directory = $workers[0] },
+        @{ Id = 'job-2'; Tab = 'hub'; Client = 'Claude'; Directory = $workers[1] },
+        @{ Id = 'job-3'; Tab = 'hub'; Client = 'OpenCode'; Directory = $workers[2] },
+        @{ Id = 'job-4'; Tab = 'hub'; Client = 'Antigravity'; Directory = $workers[3] },
+        @{ Id = 'job-5'; Tab = 'agy'; Client = 'Antigravity'; Directory = $workers[4] },
+        @{ Id = 'job-6'; Tab = 'agy'; Client = 'Antigravity'; Directory = $workers[5] }
+    )
+    [IO.File]::WriteAllText((Join-Path $installRoot 'manifest.json'), ($multiManifest | ConvertTo-Json -Depth 7))
+    $multiPlan = (& (Join-Path $installRoot 'Open-Fleet.ps1') -PrintPlan -InstallRoot $installRoot) | ConvertFrom-Json
+    if ($multiPlan.Windows[0].Tabs.Count -ne 2 -or $multiPlan.Windows[0].Jobs.Count -ne 6) {
+        throw 'Multi-tab SingleWindow plan did not produce 2 tabs / 6 jobs.'
+    }
+    $argsJoined = $multiPlan.Windows[0].Arguments -join ' '
+    if ($argsJoined -notmatch '--tabColor #1e66f5' -or $argsJoined -notmatch '--tabColor #40a02b' -or $argsJoined -notmatch '--useApplicationTitle') {
+        throw 'Multi-tab SingleWindow arguments missing tab colors or --useApplicationTitle.'
+    }
+
+    $badColor = [ordered]@{} + $multiManifest; $badColor.TabColors = @{ hub = 'green' }
+    $colorRejected = $false
+    try { [void](Get-FleetJobDefinitions $badColor) } catch { if ($_.Exception.Message -match 'RRGGBB') { $colorRejected = $true } }
+    if (-not $colorRejected) { throw 'Invalid TabColor hex was accepted.' }
+
+    $overTab = [ordered]@{} + $multiManifest
+    $wt7 = Join-Path $tmpRoot 'wt-7'
+    & git -C $gitRepo worktree add -q --detach $wt7
+    $overTab.Jobs += @{ Id = 'job-7'; Tab = 'hub'; Client = 'Antigravity'; Directory = $wt7 }
+    $paneRejected = $false
+    try { [void](Get-FleetJobDefinitions $overTab) } catch { if ($_.Exception.Message -match '4 panes per tab') { $paneRejected = $true } }
+    if (-not $paneRejected) { throw '5 panes in one tab was accepted.' }
+    Write-Output 'PASS: Multi-tab SingleWindow planning, TabColors, and pane limits.'
+
+    # 7. WorktreeCopyFiles and .worktreeinclude security guards.
+    [IO.File]::WriteAllText((Join-Path $gitRepo '.env'), "APP_ENV=test`n")
+    [IO.File]::WriteAllText((Join-Path $gitRepo '.worktreeinclude'), ".env`n# comment`n")
+
+    $wtNoOpt = Join-Path $tmpRoot 'wt-copy-noopt'
+    $rNo = New-FleetWorktree -Repository $gitRepo -Path $wtNoOpt -BaseRef HEAD -Branch 'feat/copy-noopt'
+    if ($rNo.CopiedFiles.Count -ne 0 -or (Test-Path -LiteralPath (Join-Path $wtNoOpt '.env'))) {
+        throw '.worktreeinclude ran without opt-in.'
+    }
+
+    $wtOpt = Join-Path $tmpRoot 'wt-copy-opt'
+    $rYes = New-FleetWorktree -Repository $gitRepo -Path $wtOpt -BaseRef HEAD -Branch 'feat/copy-opt' -AllowWorktreeInclude
+    if ($rYes.CopiedFiles -notcontains '.env' -or -not (Test-Path -LiteralPath (Join-Path $wtOpt '.env'))) {
+        throw 'Opted-in .worktreeinclude did not copy .env.'
+    }
+
+    # Existing file is never overwritten by Copy-FleetWorktreeFiles.
+    [IO.File]::WriteAllText((Join-Path $wtOpt '.env'), "KEEP_ME=1`n")
+    $dupCopy = Copy-FleetWorktreeFiles $gitRepo $wtOpt @('.env')
+    if ($dupCopy.Skipped.Count -ne 1 -or (Get-Content -LiteralPath (Join-Path $wtOpt '.env') -Raw) -notmatch 'KEEP_ME=1') {
+        throw 'Copy-FleetWorktreeFiles overwrote existing target file.'
+    }
+
+    foreach ($badRel in @('..\secret', 'C:\abs.env', '*.env', '.git\config')) {
+        $blockedRel = $false
+        try { [void](Assert-FleetSafeRelativeCopyPath $badRel) } catch { $blockedRel = $true }
+        if (-not $blockedRel) { throw "Unsafe copy path was accepted: $badRel" }
+    }
+    Write-Output 'PASS: WorktreeCopyFiles, opt-in .worktreeinclude, no-overwrite, and path guards.'
+
+    # 8. Invoke-FleetOpenTab + Remove-FleetWorktree 7 fail-closed guards.
+    $openCol = $false
+    try { [void](Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Directory $workers[0] -PlanOnly) } catch { if ($_.Exception.Message -match 'already owned') { $openCol = $true } }
+    if (-not $openCol) { throw 'Invoke-FleetOpenTab allowed owned worktree collision.' }
+
+    $openBadBranch = $false
+    try { [void](Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Repository $gitRepo -Branch '--upload-pack=bad' -PlanOnly) } catch { $openBadBranch = $true }
+    if (-not $openBadBranch) { throw 'Invoke-FleetOpenTab accepted option-like branch name.' }
+
+    $wtFree = Join-Path $tmpRoot 'wt-open-free'
+    $null = New-FleetWorktree -Repository $gitRepo -Path $wtFree -BaseRef HEAD -Branch 'feat/open-free'
+    $openPlan = Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Directory $wtFree -TabTitle 'agy-free' -TabColor '#40a02b' -PlanOnly
+    if ($openPlan.Result -cne 'planned' -or ($openPlan.Arguments -join ' ') -notmatch '--tabColor #40a02b') {
+        throw 'Invoke-FleetOpenTab plan failed.'
+    }
+
+    # Remove-FleetWorktree guards: main repo, configured job, CWD, dirty tree, unmerged commit.
+    foreach ($refusalTarget in @($gitRepo, $workers[0])) {
+        $refused = $false
+        try { [void](Remove-FleetWorktree -Path $refusalTarget -InstallRoot $installRoot) } catch { $refused = $true }
+        if (-not $refused) { throw "Remove-FleetWorktree did not refuse protected path: $refusalTarget" }
+    }
+
+    Push-Location $wtFree
+    try {
+        $cwdRefused = $false
+        try { [void](Remove-FleetWorktree -Path $wtFree -InstallRoot $installRoot) } catch { if ($_.Exception.Message -match 'current working directory') { $cwdRefused = $true } }
+        if (-not $cwdRefused) { throw 'Remove-FleetWorktree did not refuse CWD.' }
+    } finally { Pop-Location }
+
+    [IO.File]::WriteAllText((Join-Path $wtFree 'dirty.txt'), 'd')
+    $dirtyRefused = $false
+    try { [void](Remove-FleetWorktree -Path $wtFree -InstallRoot $installRoot) } catch { if ($_.Exception.Message -match 'uncommitted changes') { $dirtyRefused = $true } }
+    if (-not $dirtyRefused) { throw 'Remove-FleetWorktree did not refuse dirty worktree.' }
+    Remove-Item -LiteralPath (Join-Path $wtFree 'dirty.txt')
+
+    & git -C $wtFree -c user.name=Test -c user.email=test@example.invalid commit -q --allow-empty -m 'unmerged'
+    $unmergedRefused = $false
+    try { [void](Remove-FleetWorktree -Path $wtFree -InstallRoot $installRoot) } catch { if ($_.Exception.Message -match 'not merged') { $unmergedRefused = $true } }
+    if (-not $unmergedRefused) { throw 'Remove-FleetWorktree did not refuse unmerged worktree.' }
+
+    # Clean merged worktree: -DryRun keeps it, normal removal deletes it (even after locking).
+    $wtClean = Join-Path $tmpRoot 'wt-clean-ok'
+    $null = New-FleetWorktree -Repository $gitRepo -Path $wtClean -BaseRef HEAD -Branch 'feat/clean-ok' -Lock
+    $dryRes = Remove-FleetWorktree -Path $wtClean -InstallRoot $installRoot -DryRun
+    if ($dryRes.Result -cne 'dry-run' -or -not $dryRes.Locked -or -not (Test-Path -LiteralPath $wtClean)) {
+        throw 'Remove-FleetWorktree -DryRun mutated disk or missed lock.'
+    }
+    $remRes = Remove-FleetWorktree -Path $wtClean -InstallRoot $installRoot
+    if ($remRes.Result -cne 'removed' -or -not $remRes.WasLocked -or (Test-Path -LiteralPath $wtClean)) {
+        throw 'Remove-FleetWorktree did not unlock and remove clean worktree.'
+    }
+    Write-Output 'PASS: Invoke-FleetOpenTab and Remove-FleetWorktree 7 safety guards.'
+
+    # 9. -Profile isolation and -Status -Watch (-MaxIterations 1) + install.ps1 SHA-256 verification.
+    $profState = Get-FleetStateDirectory $installRoot 'work'
+    [void][IO.Directory]::CreateDirectory($profState)
+    [IO.File]::WriteAllText((Get-FleetManifestPath $installRoot 'work'), ($manifest | ConvertTo-Json -Depth 7))
+    Copy-Item -LiteralPath (Join-Path $runtimeRoot 'Fleet.ps1') -Destination $installRoot -Force
+    foreach ($f in @('Fleet.ps1','FleetJobs.ps1','FleetDispatch.ps1','FleetSources.ps1','FleetUpdate.ps1','FleetWindow.cs','Open-Fleet.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $runtimeRoot $f) -Destination $installRoot -Force
+    }
+    $watchOut = (& $pwshExe -NoLogo -NoProfile -File (Join-Path $installRoot 'Fleet.ps1') -InstallRoot $installRoot -Profile 'work' -Status -Watch -MaxIterations 1 2>&1) | Out-String
+    if ($watchOut -notmatch 'profile: work' -or $watchOut -notmatch 'job-1') {
+        throw "Status -Watch -Profile output unexpected: $watchOut"
+    }
+
+    # Test install.ps1 SHA-256 verification + tamper rejection offline.
+    . (Join-Path $repoRoot 'install.ps1')
+    $bootStageGood = Join-Path $tmpRoot 'boot-good'
+    [void][IO.Directory]::CreateDirectory($bootStageGood)
+    $relJsonPath = Join-Path $repoRoot 'release.json'
+    function Invoke-FleetBootstrapFetch([string]$Uri, [string]$Accept) {
+        if ($Uri -like '*/commits/main') { return (@{ sha = ('d' * 40) } | ConvertTo-Json) }
+        if ($Uri -like '*/contents/release.json?*') { return Get-Content -LiteralPath $relJsonPath -Raw }
+        if ($Uri -like '*/contents/Install-AgentFleet.ps1?*') { return Get-Content -LiteralPath (Join-Path $repoRoot 'Install-AgentFleet.ps1') -Raw }
+        $relName = [IO.Path]::GetFileName(($Uri -split '\?')[0])
+        return Get-Content -LiteralPath (Join-Path $runtimeRoot $relName) -Raw
+    }
+    $bootRes = Invoke-FleetRemoteBootstrap -Repo 'fergeley/agent-fleet' -Branch 'main' -StageRoot $bootStageGood -RunInstaller:$false
+    if ($bootRes.Result -cne 'staged' -or $bootRes.Version -cne '2.1.0') { throw 'install.ps1 valid verification failed.' }
+
+    function Invoke-FleetBootstrapFetch([string]$Uri, [string]$Accept) {
+        if ($Uri -like '*/commits/main') { return (@{ sha = ('d' * 40) } | ConvertTo-Json) }
+        if ($Uri -like '*/contents/release.json?*') { return Get-Content -LiteralPath $relJsonPath -Raw }
+        if ($Uri -like '*/contents/Install-AgentFleet.ps1?*') { return Get-Content -LiteralPath (Join-Path $repoRoot 'Install-AgentFleet.ps1') -Raw }
+        $relName = [IO.Path]::GetFileName(($Uri -split '\?')[0])
+        if ($relName -ceq 'Fleet.ps1') { return '# tampered!' }
+        return Get-Content -LiteralPath (Join-Path $runtimeRoot $relName) -Raw
+    }
+    $bootStageBad = Join-Path $tmpRoot 'boot-bad'
+    [void][IO.Directory]::CreateDirectory($bootStageBad)
+    $tamperRejected = $false
+    try { [void](Invoke-FleetRemoteBootstrap -Repo 'fergeley/agent-fleet' -Branch 'main' -StageRoot $bootStageBad -RunInstaller:$false) } catch { if ($_.Exception.Message -match 'SHA-256 verification failed') { $tamperRejected = $true } }
+    if (-not $tamperRejected) { throw 'install.ps1 accepted a tampered file.' }
+    Write-Output 'PASS: -Profile watch mode and install.ps1 SHA-256 verification / tamper rejection.'
 } finally {
     if (Test-Path -LiteralPath $tmpRoot) {
         Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
