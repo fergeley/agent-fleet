@@ -257,7 +257,7 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
     $ids = @(Get-FleetJobIds $Manifest)
     $entries = @($Manifest.Jobs)
     if ($JobId -and $JobId -cnotin $ids) { throw "The Jobs ID is not configured: $JobId" }
-    $layout = Get-FleetJobsLayout $Manifest
+    [void](Get-FleetJobsLayout $Manifest)
     [void](Get-FleetTabColors $Manifest)
 
     # Validate full-manifest tab limits even when a single -Job filter is active.
@@ -281,8 +281,9 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
             throw "The Jobs client is unsupported: $($entry.Client)"
         }
         if ($entry.Directory -isnot [string]) { throw "The Jobs directory is missing for $($entry.Id)." }
-        if ($layout -ceq 'SingleWindow' -and $entry.Directory.Contains(';')) {
-            throw "SingleWindow job directory cannot contain a semicolon: $($entry.Directory)"
+        # Both layouts pass the directory to Windows Terminal, which reads a semicolon as a command separator.
+        if ($entry.Directory.Contains(';')) {
+            throw "The Jobs directory for $($entry.Id) cannot contain a semicolon: $($entry.Directory)"
         }
         $tabName = Parse-FleetJobTab $entry $entry.Id
         $customArgs = Parse-FleetJobArgs $entry $entry.Id
@@ -360,11 +361,16 @@ function Get-FleetJobArguments([string]$PowerShellExecutable, [string]$OpenFleet
     return $argsList.ToArray()
 }
 
-function Start-FleetTerminal([string]$Terminal, [string[]]$Arguments) {
+# Callers check their arguments with this before they change anything, so that a refused launch leaves nothing behind.
+function Assert-FleetTerminalArgument([string[]]$Arguments) {
     foreach ($argument in $Arguments) {
         if ($argument.Contains('"')) { throw 'A Windows Terminal argument cannot contain a double quote.' }
         if ($argument -cne ';' -and $argument.Contains(';')) { throw 'A Windows Terminal argument cannot contain a semicolon, because Windows Terminal reads it as a command separator.' }
     }
+}
+
+function Start-FleetTerminal([string]$Terminal, [string[]]$Arguments) {
+    Assert-FleetTerminalArgument $Arguments
     if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'FleetWindow.cs') }
     # ArgumentList quotes each argument. A tab that wt.exe opens takes the environment of wt.exe,
     # so give it the sign-in environment instead of the environment of the shell that ran Fleet.

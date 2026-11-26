@@ -33,7 +33,20 @@ if (-not ('FleetNativeProbe.Win' -as [type])) {
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int size);
 public delegate bool WindowCallback(IntPtr window, IntPtr data);
 [DllImport("user32.dll")] public static extern bool EnumWindows(WindowCallback callback, IntPtr data);
-[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, System.Text.StringBuilder text, int size);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+// The message boxes with this title, so that a check can tell a new notice from one that was open before.
+public static long[] Dialogs(string title) {
+    var found = new System.Collections.Generic.List<long>();
+    EnumWindows((window, data) => {
+        var name = new System.Text.StringBuilder(64); GetClassName(window, name, name.Capacity);
+        var text = new System.Text.StringBuilder(256); GetWindowText(window, text, text.Capacity);
+        if (name.ToString() == "#32770" && text.ToString() == title) found.Add(window.ToInt64());
+        return true;
+    }, IntPtr.Zero);
+    return found.ToArray();
+}
 [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
 // The Terminal windows that this process hosts, hidden ones included.
 public static long[] HostingWindows(uint processId) {
@@ -82,13 +95,14 @@ function Invoke-ProbeFleet([string[]]$Arguments) {
     [pscustomobject]@{ ExitCode = $code; Text = $text; Outcome = $outcome }
 }
 
-function Write-ProbeManifest([string]$Layout, [string[]]$JobIds) {
+function Write-ProbeManifest([string]$Layout, [string[]]$JobIds, [string[]]$Tabs = @()) {
     $clients = @('Codex', 'Claude', 'Antigravity', 'OpenCode')
     $jobs = for ($i = 0; $i -lt $JobIds.Count; $i++) {
         [ordered]@{
             Id = $JobIds[$i]; Client = $clients[$i % 4]; Directory = $script:worktrees[$i]
             Args = @('-NoLogo', '-NoProfile', '-File', $script:probeClient, '-JobId', $JobIds[$i], '-Out', $receipts)
             Env = @{ FLEET_JOB_ENV = "$($JobIds[$i])-env" }
+            Tab = $(if ($Tabs.Count -gt $i) { $Tabs[$i] } else { 'fleet' })
         }
     }
     $manifest = [ordered]@{
@@ -109,12 +123,28 @@ function Wait-ProbeReceipts([string[]]$JobIds, [int]$Before, [int]$TimeoutSecond
     @($files | Sort-Object LastWriteTimeUtc | Select-Object -Skip $Before | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
 }
 
-function Get-ProbeWindows { @([FleetWindow]::Find("AgentFleet.$lockHash.Jobs")) }
+# Registered probe windows, and probe windows that still show their startup title because registration did not happen.
+function Get-ProbeWindows { @(@([FleetWindow]::Find("AgentFleet.$lockHash.Jobs")) + @([FleetWindow]::FindJobTitles($lockHash)) | Select-Object -Unique) }
 
 function Close-ProbeWindows {
     foreach ($window in Get-ProbeWindows) { [void][FleetNativeProbe.Win]::PostMessage([IntPtr]::new($window), 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ((Get-ProbeWindows).Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 200 }
+    while ((Get-ProbeWindows).Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt 8) { Start-Sleep -Milliseconds 200 }
+    # A window with two tabs asks before it closes, and a hung window ignores WM_CLOSE. End the Terminal process of
+    # such a window only when every window of that process is a probe window.
+    foreach ($window in Get-ProbeWindows) {
+        [uint32]$terminalPid = 0
+        [void][FleetNativeProbe.Win]::GetWindowThreadProcessId([IntPtr]::new($window), [ref]$terminalPid)
+        $probeWindows = Get-ProbeWindows
+        $foreign = @([FleetNativeProbe.Win]::HostingWindows($terminalPid) | Where-Object { $_ -notin $probeWindows })
+        if ($terminalPid -and $foreign.Count -eq 0) {
+            Stop-Process -Id $terminalPid -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Output "A probe window did not close in Terminal process $terminalPid, which also hosts $($foreign.Count) other window(s). It was left open."
+        }
+    }
+    $clock.Restart()
+    while ((Get-ProbeWindows).Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 200 }
     (Get-ProbeWindows).Count -eq 0
 }
 
@@ -196,8 +226,21 @@ $record = [ordered]@{
     Assert-Probe ($reopen.ExitCode -eq 0 -and $reopen.Outcome.Result -ceq 'focused') 'Reopen exits 0 and focuses the window' $reopen.Text
     Start-Sleep -Seconds 3
     Assert-Probe (@(Get-ChildItem -LiteralPath $receipts -File).Count -eq $before) 'Reopen starts no client again'
+    # Restore and shrink the shared window first, so that -Arrange has to move it back.
+    [void][FleetNativeProbe.Win]::ShowWindow([IntPtr]::new($windows[0]), 9)
+    Start-Sleep -Milliseconds 300
+    [void][FleetNativeProbe.Win]::SetWindowPos([IntPtr]::new($windows[0]), [IntPtr]::Zero, $area[0] + 40, $area[1] + 40, 640, 400, 0x0014)
+    Start-Sleep -Milliseconds 300
+    Assert-Probe (-not [FleetNativeProbe.Win]::IsZoomed([IntPtr]::new($windows[0]))) 'The probe restored the shared window before -Arrange'
     $arrange = Invoke-ProbeFleet @('-Arrange')
     Assert-Probe ($arrange.ExitCode -eq 0 -and $arrange.Outcome.Result -ceq 'arranged') '-Arrange exits 0 and arranges the shared window' $arrange.Text
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while (-not [FleetNativeProbe.Win]::IsZoomed([IntPtr]::new($windows[0])) -and $clock.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 100 }
+    Assert-Probe ([FleetNativeProbe.Win]::IsZoomed([IntPtr]::new($windows[0]))) '-Arrange maximizes the restored shared window again'
+    # In the same process, a successful reopen must leave exit code 0, not the code of an earlier native command.
+    & cmd.exe /c exit 7
+    $null = & (Join-Path $installRoot 'Fleet.ps1') -InstallRoot $installRoot
+    Assert-Probe ($LASTEXITCODE -eq 0) 'A reopen in the same process exits 0 after a failed native command' "(exit code $LASTEXITCODE)"
     $status = Invoke-ProbeFleet @('-Status', '-Json')
     Assert-Probe ($status.ExitCode -eq 0 -and @($status.Outcome.Jobs | Where-Object { $_.Instance.Window.State -ceq 'observed' }).Count -eq 4) '-Status observes all four windows' $status.Text
     $global:LASTEXITCODE = 0
@@ -211,7 +254,7 @@ $record = [ordered]@{
     Write-Output 'PASS: SingleWindow launch, reopen, arrange, status, open tab.'
 
     # 2b. Windows Terminal 1.25 hung in about half of the four-pane launches that changed the window size during pane
-    # creation. Repeat the launch, so that a regression shows as a hung window or a missing pane.
+    # creation. Repeat the launch, so that a regression is likely to show as a hung window or a missing pane.
     foreach ($round in 1..$Repeats) {
         $before = @(Get-ChildItem -LiteralPath $receipts -File).Count
         $launch = Invoke-ProbeFleet @()
@@ -222,6 +265,18 @@ $record = [ordered]@{
         Assert-Probe (Close-ProbeWindows) "The window of repeated launch $round closes"
     }
     Write-Output "PASS: $Repeats repeated SingleWindow launches."
+
+    # 2c. Two tabs in the shared window. The panes of the tab that is not selected must start too, or the pane wait
+    # would report those jobs and never maximize the window.
+    Write-ProbeManifest 'SingleWindow' $fourJobs @('hub', 'hub', 'agy', 'agy')
+    $before = @(Get-ChildItem -LiteralPath $receipts -File).Count
+    $launch = Invoke-ProbeFleet @()
+    Assert-Probe ($launch.ExitCode -eq 0 -and @($launch.Outcome.Jobs | Where-Object { $_.Result -ceq 'launched' -and -not $_.Notice }).Count -eq 4) 'A two-tab launch exits 0 and starts every pane within the wait' $launch.Text
+    Assert-ProbeReceipts (Wait-ProbeReceipts $fourJobs $before 30) $fourJobs 'Two-tab'
+    $windows = Get-ProbeWindows
+    Assert-Probe ($windows.Count -eq 1 -and [FleetWindow]::IsResponsive($windows[0]) -and [FleetNativeProbe.Win]::IsZoomed([IntPtr]::new($windows[0]))) 'The two-tab window is responsive and maximized'
+    Assert-Probe (Close-ProbeWindows) 'The two-tab window closes'
+    Write-Output 'PASS: two-tab SingleWindow launch.'
 
     # 3. JobWindows with two jobs: one window per job, each in its tile.
     Write-ProbeManifest 'JobWindows' @('job-1', 'job-2')
@@ -238,8 +293,17 @@ $record = [ordered]@{
         $offBy = [Math]::Max([Math]::Max([Math]::Abs($rect[0] - $expected[0]), [Math]::Abs($rect[1] - $expected[1])), [Math]::Max([Math]::Abs($rect[2] - $expected[2]), [Math]::Abs($rect[3] - $expected[3])))
         Assert-Probe ($offBy -le 24) "The window of $($job.Id) is in its tile" "(window $($rect -join ','); tile $($expected -join ','))"
     }
+    # Move the first job window away, so that -Arrange has to put it back in its tile.
+    $first = [long]$launch.Outcome.Jobs[0].Window
+    [void][FleetNativeProbe.Win]::SetWindowPos([IntPtr]::new($first), [IntPtr]::Zero, $area[0] + 60, $area[1] + 60, 500, 300, 0x0014)
+    Start-Sleep -Milliseconds 300
     $arrange = Invoke-ProbeFleet @('-Arrange')
     Assert-Probe ($arrange.ExitCode -eq 0 -and $arrange.Outcome.Result -ceq 'arranged') '-Arrange exits 0 for job windows' $arrange.Text
+    Start-Sleep -Milliseconds 500
+    $expected = [FleetWindow]::TileBounds($area, 2, 0)
+    $rect = Get-ProbeRect $first
+    $offBy = [Math]::Max([Math]::Max([Math]::Abs($rect[0] - $expected[0]), [Math]::Abs($rect[1] - $expected[1])), [Math]::Max([Math]::Abs($rect[2] - $expected[2]), [Math]::Abs($rect[3] - $expected[3])))
+    Assert-Probe ($offBy -le 24) '-Arrange moves a displaced job window back to its tile' "(window $($rect -join ','); tile $($expected -join ','))"
     Assert-Probe (Close-ProbeWindows) 'The job windows close'
     Write-Output 'PASS: JobWindows launch, tiles, arrange.'
 
@@ -263,18 +327,20 @@ $record = [ordered]@{
     $marker.BootId = $currentBoot
     [IO.File]::WriteAllText((Join-Path $stateDirectory 'job-job-1.pending.json'), ($marker | ConvertTo-Json))
     $before = @(Get-ChildItem -LiteralPath $receipts -File).Count
+    $dialogsBefore = @([FleetNativeProbe.Win]::Dialogs('Agent Fleet'))
     $launch = Invoke-ProbeFleet @('-Quiet')
     $blocked = @($launch.Outcome.Jobs | Where-Object Id -ceq 'job-1')[0]
     Assert-Probe ($launch.ExitCode -eq 1 -and $blocked.Result -ceq 'blocked') 'A marker of this boot blocks its job and the launch exits 1' $launch.Text
-    # The quiet launch has already returned, so the notice runs in its own process and does not hold the launch lock.
-    $notice = [IntPtr]::Zero
+    # The quiet launch has already returned when the notice appears, so the notice runs in a process of its own.
+    # Only a notice that was not open before this launch counts, and only that one is closed.
+    $notice = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($notice -eq [IntPtr]::Zero -and $clock.Elapsed.TotalSeconds -lt 15) {
-        $notice = [FleetNativeProbe.Win]::FindWindow('#32770', 'Agent Fleet')
-        if ($notice -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+    while (-not $notice -and $clock.Elapsed.TotalSeconds -lt 15) {
+        $notice = @([FleetNativeProbe.Win]::Dialogs('Agent Fleet') | Where-Object { $_ -notin $dialogsBefore })[0]
+        if (-not $notice) { Start-Sleep -Milliseconds 200 }
     }
-    Assert-Probe ($notice -ne [IntPtr]::Zero) 'A quiet launch with a blocked job shows a notice after it returns'
-    [void][FleetNativeProbe.Win]::PostMessage($notice, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+    Assert-Probe ([bool]$notice) 'A quiet launch with a blocked job shows a notice after it returns'
+    [void][FleetNativeProbe.Win]::PostMessage([IntPtr]::new($notice), 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
     Assert-Probe ($blocked.Message -match 'agent-fleet -Job job-1 -ResetPending') 'The blocked job names the reset command' $blocked.Message
     Assert-Probe (@($launch.Outcome.Jobs | Where-Object Result -ceq 'launched').Count -eq 3) 'The other three jobs open' $launch.Text
     [void](Wait-ProbeReceipts @('job-2', 'job-3', 'job-4') $before)
@@ -289,22 +355,7 @@ $record = [ordered]@{
     $passed = $true
 } finally {
     $closed = Close-ProbeWindows
-    # A hung window ignores WM_CLOSE, and a window with two tabs asks before it closes. End the Terminal process of such
-    # a window only when every window of that process is a probe window.
-    foreach ($window in Get-ProbeWindows) {
-        [uint32]$terminalPid = 0
-        [void][FleetNativeProbe.Win]::GetWindowThreadProcessId([IntPtr]::new($window), [ref]$terminalPid)
-        $probeWindows = Get-ProbeWindows
-        $foreign = @([FleetNativeProbe.Win]::HostingWindows($terminalPid) | Where-Object { $_ -notin $probeWindows })
-        if ($terminalPid -and $foreign.Count -eq 0) {
-            Write-Output "A probe window did not close (responsive: $([FleetWindow]::IsResponsive($window))). Ending Terminal process $terminalPid, which hosts only probe windows."
-            Stop-Process -Id $terminalPid -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-        } else {
-            Write-Output "A probe window did not close in Terminal process $terminalPid, which also hosts $($foreign.Count) other window(s). It was left open."
-        }
-    }
-    $closed = (Get-ProbeWindows).Count -eq 0
+
     foreach ($name in $savedVariables.Keys) { [Environment]::SetEnvironmentVariable($name, $savedVariables[$name], 'Process') }
     if ($passed -and $closed) {
         Start-Sleep -Seconds 1

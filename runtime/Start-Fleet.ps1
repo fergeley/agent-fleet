@@ -189,7 +189,7 @@ try {
         $global:LASTEXITCODE = 0
         & (Join-Path $runtime 'Fleet.ps1') -InstallRoot $installRoot @launch
         $fleetExitCode = $LASTEXITCODE
-        if ($fleetExitCode) { exit $fleetExitCode }
+        # A partial launch runs the daily check too, so that a launch that is partial every day still receives its fix.
         if (-not ($PrintPlan -or $ResetPending -or $Arrange -or $NoUpdate)) {
             try {
                 $result = Invoke-FleetUpdate $installRoot
@@ -199,6 +199,7 @@ try {
                 if (-not $Quiet) { Write-Warning 'Fleet opened, but its automatic update check could not finish.' }
             }
         }
+        if ($fleetExitCode) { exit $fleetExitCode }
     } finally {
         if ($acquired) { $mutex.ReleaseMutex() }
         $mutex.Dispose()

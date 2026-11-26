@@ -20,6 +20,8 @@ function Invoke-FleetBootstrapFetch([string]$Uri, [string]$Accept) {
     $headers = @{ 'User-Agent' = 'AgentFleet-Bootstrap/2.1' }
     if ($Accept) { $headers['Accept'] = $Accept }
     $resp = Invoke-WebRequest -Uri $Uri -Headers $headers -UseBasicParsing -TimeoutSec 20
+    # GitHub sends raw file content with a media type that PowerShell does not read as text, so it arrives as bytes.
+    if ($resp.Content -is [byte[]]) { return [Text.UTF8Encoding]::new($false).GetString($resp.Content) }
     return $resp.Content
 }
 

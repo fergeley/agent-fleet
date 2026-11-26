@@ -411,7 +411,8 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
 
     $createdWorktree = $null
     $targetDir = $Directory
-    if ([string]::IsNullOrWhiteSpace($targetDir)) {
+    $newWorktree = [string]::IsNullOrWhiteSpace($targetDir)
+    if ($newWorktree) {
         if ([string]::IsNullOrWhiteSpace($Branch) -or [string]::IsNullOrWhiteSpace($Repository)) {
             throw '-OpenTab requires either -Directory or both -Repository and -Branch.'
         }
@@ -425,14 +426,7 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
         $repoName = Split-Path -Leaf $repoFull
         $slug = ($Branch -replace '[^A-Za-z0-9._-]+', '-').Trim('-')
         if ([string]::IsNullOrWhiteSpace($slug)) { throw "Could not derive worktree folder name from branch: $Branch" }
-        $candidatePath = Join-Path $repoParent "$repoName-$slug"
-        if (-not $PlanOnly) {
-            $createdWorktree = New-FleetWorktree -Repository $repoFull -Path $candidatePath -BaseRef $BaseRef -Branch $Branch -Lock:$Lock -Manifest $Manifest -AllowWorktreeInclude:$AllowWorktreeInclude
-        } else {
-            $candidateDir = $candidatePath
-            $targetDir = $candidateDir
-        }
-        if ($createdWorktree) { $targetDir = $createdWorktree.Path }
+        $targetDir = Join-Path $repoParent "$repoName-$slug"
     } else {
         Assert-FleetAbsolutePath $targetDir
         if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) {
@@ -443,20 +437,6 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
     if ($targetDir.Contains(';')) {
         throw "The -OpenTab directory cannot contain a semicolon: $targetDir"
     }
-
-    $targetGitDir = ''
-    if (Test-Path -LiteralPath $targetDir -PathType Container) {
-        $gdRaw = (& git -C $targetDir rev-parse --absolute-git-dir 2>$null)
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gdRaw)) {
-            throw "The -OpenTab directory is not a Git worktree: $targetDir"
-        }
-        $targetGitDir = Get-FleetFinalDirectoryPath $gdRaw.Trim()
-        $known = Get-FleetKnownWorktrees $InstallRoot
-        if ($known.GitDirectories.Contains($targetGitDir)) {
-            throw "The worktree is already owned by a configured or bound Agent Fleet job: $targetDir"
-        }
-    }
-
     $stateDir = Get-FleetStateDirectory $InstallRoot $Profile
     $liveWindows = [ordered]@{}
     if (('FleetWindow' -as [type]) -and (Test-Path -LiteralPath $stateDir -PathType Container)) {
@@ -483,6 +463,26 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
         "$Client | $Branch"
     } else {
         "$Client | $(Split-Path -Leaf $targetDir.TrimEnd('\'))"
+    }
+    # Refuse the tab before the worktree exists, so that a plan fails as the run would
+    # and a refused tab leaves no worktree or branch behind.
+    Assert-FleetTerminalArgument (@($windowName, $effectiveTitle, $targetDir) + $resolvedArgs)
+    if ($newWorktree -and -not $PlanOnly) {
+        $createdWorktree = New-FleetWorktree -Repository $repoFull -Path $targetDir -BaseRef $BaseRef -Branch $Branch -Lock:$Lock -Manifest $Manifest -AllowWorktreeInclude:$AllowWorktreeInclude
+        $targetDir = $createdWorktree.Path
+    }
+
+    $targetGitDir = ''
+    if (Test-Path -LiteralPath $targetDir -PathType Container) {
+        $gdRaw = (& git -C $targetDir rev-parse --absolute-git-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gdRaw)) {
+            throw "The -OpenTab directory is not a Git worktree: $targetDir"
+        }
+        $targetGitDir = Get-FleetFinalDirectoryPath $gdRaw.Trim()
+        $known = Get-FleetKnownWorktrees $InstallRoot
+        if ($known.GitDirectories.Contains($targetGitDir)) {
+            throw "The worktree is already owned by a configured or bound Agent Fleet job: $targetDir"
+        }
     }
 
     $wtArgs = [Collections.Generic.List[string]]::new()
@@ -674,6 +674,14 @@ function Invoke-FleetProcessSync([string]$Executable, [string]$WorkingDirectory,
     }
 }
 
+# cmd.exe parses the command line of a .cmd or .bat file again, so text in a prompt such as & or %VAR% would run or
+# expand there. Dispatch and Queue pass text from the caller, so they start only a program file.
+function Assert-FleetDirectExecutable([string]$Executable, [string]$Client) {
+    if ([IO.Path]::GetExtension($Executable) -notin @('.exe', '.com')) {
+        throw "Dispatch and Queue need the $Client program file (.exe), not a script or shim such as a .cmd file: $Executable"
+    }
+}
+
 function Invoke-FleetDispatch($Manifest, [string]$Client, [string]$Directory, [string]$Prompt,
     [string]$Model = '', [string]$Name = '', [string]$InstallRoot = $PSScriptRoot, [string]$Profile = '') {
     if ($Client -cnotin @('Claude', 'Codex')) {
@@ -691,7 +699,10 @@ function Invoke-FleetDispatch($Manifest, [string]$Client, [string]$Directory, [s
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "The selected client is unavailable: $Client"
     }
+    Assert-FleetDirectExecutable $executable $Client
     if ($Client -ceq 'Claude') {
+        # Claude reads an argument that starts with - as an option, so such a prompt would not reach the session.
+        if ($Prompt.TrimStart().StartsWith('-')) { throw 'A Claude dispatch prompt cannot start with -. Start it with a word.' }
         $argsList = [Collections.Generic.List[string]]::new()
         $argsList.Add('--bg')
         if (-not [string]::IsNullOrWhiteSpace($Model)) {
@@ -724,9 +735,12 @@ function Invoke-FleetDispatch($Manifest, [string]$Client, [string]$Directory, [s
         $codexArgs.Add('-m')
         $codexArgs.Add($Model)
     }
-    $codexArgs.Add($Prompt)
-    # Start-Process joins an argument array without quotes, so a prompt with spaces would reach Codex as several arguments.
-    $proc = Start-Process -FilePath $executable -ArgumentList (ConvertTo-FleetCommandLine $codexArgs.ToArray()) -WorkingDirectory $Directory -WindowStyle Hidden -PassThru -RedirectStandardOutput $logPath -RedirectStandardError $errPath
+    # codex exec reads its prompt from standard input when the prompt argument is -. A prompt there needs no quoting,
+    # and cannot be read as an option or as a subcommand such as review.
+    $codexArgs.Add('-')
+    $promptPath = "$logPath.prompt.txt"
+    [IO.File]::WriteAllText($promptPath, $Prompt, [Text.UTF8Encoding]::new($false))
+    $proc = Start-Process -FilePath $executable -ArgumentList (ConvertTo-FleetCommandLine $codexArgs.ToArray()) -WorkingDirectory $Directory -WindowStyle Hidden -PassThru -RedirectStandardInput $promptPath -RedirectStandardOutput $logPath -RedirectStandardError $errPath
     [pscustomobject]@{
         Result = 'dispatched'
         Client = 'Codex'
@@ -744,6 +758,7 @@ function Invoke-FleetQueue($Manifest, [string]$Thread, [string]$Message, [switch
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw 'The selected client is unavailable: Codex'
     }
+    Assert-FleetDirectExecutable $executable 'Codex'
     $argsList = [Collections.Generic.List[string]]::new()
     $argsList.AddRange([string[]]@('queue', '--thread', $Thread, '--message', $Message))
     if ($Resume) { $argsList.Add('--resume') }

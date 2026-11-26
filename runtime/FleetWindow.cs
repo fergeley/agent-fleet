@@ -171,10 +171,12 @@ public static class FleetWindow
     public static int[] TileBounds(int[] area, int count, int index)
     {
         if (area == null || area.Length != 4 || area[2] < 1 || area[3] < 1) throw new ArgumentException("The work area must contain a positive width and height.");
-        if (count < 1 || count > 4) throw new ArgumentOutOfRangeException("count");
+        if (count < 1 || count > 16) throw new ArgumentOutOfRangeException("count");
         if (index < 0 || index >= count) throw new ArgumentOutOfRangeException("index");
-        int columns = count == 1 ? 1 : 2;
-        int rows = count > 2 ? 2 : 1;
+        // A manifest allows 16 job windows. Columns are the square root of the count, rounded up, which keeps the layouts of 1 to 4.
+        int columns = 1;
+        while (columns * columns < count) columns++;
+        int rows = (count + columns - 1) / columns;
         if (area[2] < columns || area[3] < rows) throw new ArgumentException("The work area is too small for this layout.");
         int column = index % columns;
         int row = index / columns;
@@ -197,12 +199,19 @@ public static class FleetWindow
         } finally { SetThreadDpiAwarenessContext(previous); }
     }
 
-    // False when the thread of the window does not answer a WM_NULL within two seconds, as a hung window does not.
+    // False when the thread of the window does not answer a WM_NULL within five seconds. Windows itself counts a window as hung
+    // after five seconds without messages, so a Terminal that is only busy for a moment still counts as responsive.
     public static bool IsResponsive(long handle)
     {
         IntPtr result;
         // SMTO_ABORTIFHUNG returns at once for a window that Windows already counts as hung.
-        return SendMessageTimeout(new IntPtr(handle), 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 2000, out result) != IntPtr.Zero;
+        return SendMessageTimeout(new IntPtr(handle), 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 5000, out result) != IntPtr.Zero;
+    }
+
+    // IsResponsive is also false for a window that closed, so a caller checks this first to tell closed from hung.
+    public static bool Exists(long handle)
+    {
+        return IsWindow(new IntPtr(handle));
     }
 
     // Place the window on the work area, then maximize it there, so that it stays maximized on the monitor under the pointer.
@@ -235,9 +244,30 @@ public static class FleetWindow
                     variables[entry.Substring(0, separator)] = entry.Substring(separator + 1);
                 }
                 if (variables.Count == 0) throw new InvalidOperationException("The sign-in environment is empty.");
+                // CreateEnvironmentBlock leaves some system values unexpanded, such as %ProgramFiles% in PSModulePath.
+                // Expand them from the block itself, as Explorer does for a new process.
+                foreach (var name in new List<string>(variables.Keys)) {
+                    string value = variables[name];
+                    if (value.IndexOf('%') < 0) continue;
+                    foreach (var reference in variables) {
+                        if (!String.Equals(reference.Key, name, StringComparison.OrdinalIgnoreCase))
+                            value = ReplaceIgnoreCase(value, "%" + reference.Key + "%", reference.Value);
+                    }
+                    variables[name] = value;
+                }
                 return variables;
             } finally { DestroyEnvironmentBlock(block); }
         } finally { CloseHandle(token); }
+    }
+
+    private static string ReplaceIgnoreCase(string text, string find, string replacement)
+    {
+        int start = text.IndexOf(find, StringComparison.OrdinalIgnoreCase);
+        while (start >= 0) {
+            text = text.Substring(0, start) + replacement + text.Substring(start + find.Length);
+            start = text.IndexOf(find, start + replacement.Length, StringComparison.OrdinalIgnoreCase);
+        }
+        return text;
     }
 
     public static bool Register(long handle, string property)

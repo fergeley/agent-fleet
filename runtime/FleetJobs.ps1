@@ -444,7 +444,8 @@ function Move-FleetEarlierBootPendingMarkers([string]$StateDirectory) {
         $retired = Join-Path $StateDirectory 'retired'
         [void][IO.Directory]::CreateDirectory($retired)
         $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
-        Move-Item -LiteralPath $file.FullName -Destination (Join-Path $retired "$([IO.Path]::GetFileNameWithoutExtension($file.Name)).$stamp.json")
+        # A marker that another program holds open stays, and the launch treats it as before.
+        try { Move-Item -LiteralPath $file.FullName -Destination (Join-Path $retired "$([IO.Path]::GetFileNameWithoutExtension($file.Name)).$stamp.json") } catch { continue }
         $moved.Add($id)
     }
     $moved.ToArray()
@@ -462,20 +463,27 @@ function Wait-FleetPanesStarted([string]$StateDirectory, [object[]]$JobPlans, [i
 }
 
 function Get-FleetUnresponsiveMessage {
-    'Windows Terminal stopped responding. Close that Terminal window. If it does not close, end WindowsTerminal.exe in Task Manager, which closes every Terminal window. Then run agent-fleet again.'
+    'Windows Terminal stopped responding. When it does not recover within a minute, end it: closing a frozen window or ending WindowsTerminal.exe in Task Manager ends every Terminal window and the sessions in them, so first save what you need from the other Terminal windows. Then run agent-fleet again.'
 }
 
-# Why a pane of a registered window has not started: a hung Terminal, or a pane that is only slow.
-function Get-FleetPaneDelayMessage([long]$Window, [int]$Seconds) {
-    if ([FleetWindow]::IsResponsive($Window)) { "Its pane had not started after $Seconds seconds, so Fleet did not move the window. Look at the Agent Fleet window." }
-    else { 'Its pane did not start. ' + (Get-FleetUnresponsiveMessage) }
+# Why a pane of a registered window has not started: the window closed, a hung Terminal, or a pane that is only slow.
+# A slow pane in a responsive window still opens, for example while a heavy PowerShell profile loads at sign-in.
+function Get-FleetPaneDelay([long]$Window, [int]$Seconds) {
+    if (-not [FleetWindow]::Exists($Window)) {
+        return [pscustomobject]@{ Result = 'blocked'; Notice = $false; Message = 'Its window closed before its pane started. Run agent-fleet again.' }
+    }
+    if ([FleetWindow]::IsResponsive($Window)) {
+        return [pscustomobject]@{ Result = 'launched'; Notice = $true; Message = "Its pane had not started after $Seconds seconds, so Fleet left the window where Windows Terminal opened it. When the pane has started, run agent-fleet -Arrange to place it." }
+    }
+    [pscustomobject]@{ Result = 'blocked'; Notice = $false; Message = 'Its pane did not start. ' + (Get-FleetUnresponsiveMessage) }
 }
 
 # The text of the notice that a quiet launch shows when a job could not open.
-function Format-FleetLaunchNotice($Outcome) {
+function Format-FleetLaunchNotice($Outcome, [string]$Profile = '') {
     $lines = @(@($Outcome.Jobs) | Where-Object { $_.Result -in @('blocked', 'error') } | ForEach-Object { "$($_.Id): $($_.Message)" })
-    $text = "Agent Fleet could not open every job.`n`n" + ($lines -join "`n`n") + "`n`nRun agent-fleet -Status for details."
-    if ($text.Length -gt 3000) { $text = $text.Substring(0, 2997) + '...' }
+    $text = "Agent Fleet could not open every job.`n`n" + ($lines -join "`n`n") + "`n`nRun agent-fleet -Status$(if ($Profile) { " -Profile $Profile" }) for details."
+    # Fleet.ps1 encodes the text twice into one command line, which Windows limits to 32,767 characters.
+    if ($text.Length -gt 2000) { $text = $text.Substring(0, 1997) + '...' }
     $text
 }
 
@@ -596,6 +604,11 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
                 $evidence = Read-FleetJobEvidence $pendingPath $LockHash $InstallRoot $Profile
                 $window = Resolve-FleetPendingWindow $evidence $StateDirectory $LockHash $InstallRoot $Profile
                 $byId[$id].Window = $window
+                if (-not [FleetWindow]::IsResponsive($window)) {
+                    $byId[$id].Result = 'blocked'
+                    $byId[$id].Message = 'The recovered window of this job is not responding. ' + (Get-FleetUnresponsiveMessage)
+                    continue
+                }
                 $byId[$id].Result = 'recovered'
                 $byId[$id].Message = 'The exact pending window was recovered.'
                 if (-not $focusedByHandle.ContainsKey($window)) { $focusedByHandle[$window] = [FleetWindow]::Focus($window) }
@@ -615,8 +628,9 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
                     }
                 }
             } catch {
+                # -ResetPending refuses while the state scan is uncertain, as after a state file it cannot read, so name it only after a clean scan.
                 $byId[$id].Result = 'blocked'
-                $byId[$id].Message = $_.Exception.Message + (Get-FleetResetHint $id $Profile)
+                $byId[$id].Message = $_.Exception.Message + $(if (-not $uncertainState) { Get-FleetResetHint $id $Profile })
             }
         }
     }
@@ -706,6 +720,11 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
             if ($placedByHandle.ContainsKey($hwnd)) {
                 $result.Result = 'arranged'
                 $result.Message = $placedByHandle[$hwnd]
+                continue
+            }
+            if (-not [FleetWindow]::IsResponsive($hwnd)) {
+                $result.Result = 'blocked'
+                $result.Message = 'The owned window of this job is not responding. ' + (Get-FleetUnresponsiveMessage)
                 continue
             }
             $isShared = $handleJobCounts[$hwnd] -gt 1 -or ($liveLayoutByHandle.ContainsKey($hwnd) -and $liveLayoutByHandle[$hwnd] -ceq 'SingleWindow')
@@ -808,10 +827,13 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
                 $placed = try { Move-FleetWindowToTile $foundHwnd $plan.WindowProperty $area 1 0 $true } catch { $false }
                 if (-not $placed) { foreach ($jobPlan in $toOpen) { $byId[$jobPlan.Id].Message += ' Its window could not be moved to the work area.' } }
             } else {
-                $delay = Get-FleetPaneDelayMessage $foundHwnd 20
-                foreach ($jobPlan in $waiting) {
-                    $byId[$jobPlan.Id].Result = 'blocked'
-                    $byId[$jobPlan.Id].Message = $delay
+                $delay = Get-FleetPaneDelay $foundHwnd 20
+                # A frozen or closed window holds every job in it, also the jobs whose pane started.
+                $affected = if ($delay.Result -ceq 'blocked') { $toOpen } else { $waiting }
+                foreach ($jobPlan in $affected) {
+                    $byId[$jobPlan.Id].Result = $delay.Result
+                    $byId[$jobPlan.Id].Notice = $delay.Notice
+                    $byId[$jobPlan.Id].Message = $delay.Message
                 }
             }
             $overall = if (@($results | Where-Object { $_.Result -eq 'blocked' }).Count -gt 0) { 'partial' } else { 'launched' }
@@ -864,10 +886,12 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
         }
         Confirm-FleetJobWindow $ev $foundHwnd $StateDirectory
         if (@(Wait-FleetPanesStarted $StateDirectory @($jobPlan) 20000).Count -gt 0) {
+            $delay = Get-FleetPaneDelay $foundHwnd 20
             $byId[$jobPlan.Id].Window = $foundHwnd
-            $byId[$jobPlan.Id].Result = 'blocked'
+            $byId[$jobPlan.Id].Result = $delay.Result
+            $byId[$jobPlan.Id].Notice = $delay.Notice
             $byId[$jobPlan.Id].ObservedHead = $jobPlan.ObservedHead
-            $byId[$jobPlan.Id].Message = Get-FleetPaneDelayMessage $foundHwnd 20
+            $byId[$jobPlan.Id].Message = $delay.Message
             continue
         }
         $placed = try { Move-FleetWindowToTile $foundHwnd $jobPlan.Property $area $ids.Count $slotIndex $false } catch { $false }

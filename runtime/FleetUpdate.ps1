@@ -304,6 +304,20 @@ function Get-FleetUpdateSource([string]$InstallRoot) {
     [pscustomobject]@{ Repo = $repo; Transport = $transport; PathPrefix = '' }
 }
 
+# True when a pending launch can still be running. A marker that records another known boot comes from before a
+# restart, which ended its window, so it does not hold back an update. A marker without a boot record, or one that
+# cannot be read, still does.
+function Test-FleetLivePendingLaunch([string]$StateDirectory) {
+    $currentBoot = try {
+        [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name BootId -ErrorAction Stop)
+    } catch { '' }
+    foreach ($file in @(Get-ChildItem -LiteralPath $StateDirectory -Filter 'job-*.pending.json' -File)) {
+        $bootId = try { [string]([IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -ErrorAction Stop).BootId } catch { '' }
+        if ([string]::IsNullOrWhiteSpace($currentBoot) -or [string]::IsNullOrWhiteSpace($bootId) -or $bootId -ceq 'unknown' -or $bootId -ceq $currentBoot) { return $true }
+    }
+    $false
+}
+
 function Invoke-FleetUpdate([string]$InstallRoot, [switch]$Force) {
     $receiptPath = Join-Path $InstallRoot 'installation.json'
     $statusPath = Join-Path $InstallRoot 'status.json'
@@ -363,8 +377,7 @@ function Invoke-FleetUpdate([string]$InstallRoot, [switch]$Force) {
             $status.Message = 'Fleet is current; no newer compatible release is available.'
         } else {
             $state = Join-Path $InstallRoot 'state'
-            if ((Test-Path -LiteralPath $state) -and
-                (@(Get-ChildItem -LiteralPath $state -Filter 'job-*.pending.json').Count -gt 0)) {
+            if ((Test-Path -LiteralPath $state) -and (Test-FleetLivePendingLaunch $state)) {
                 $status.Result = 'deferred'
                 $status.Message = 'Fleet update waits for pending launches to finish.'
                 return [pscustomobject]$status

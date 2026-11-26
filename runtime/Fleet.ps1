@@ -175,7 +175,7 @@ if ($outcome.Result -in @('partial', 'error')) {
         # A quiet launch, such as the Startup shortcut, has no console. A separate process shows the notice,
         # so that the launch lock is not held while it waits for the person to close it.
         try {
-            $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Format-FleetLaunchNotice $outcome)))
+            $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Format-FleetLaunchNotice $outcome $Profile)))
             $popup = "`$null = (New-Object -ComObject WScript.Shell).Popup([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$text')), 0, 'Agent Fleet', 48)"
             $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($popup))
             Start-Process -FilePath $manifest.PowerShell -ArgumentList "-NoLogo -NoProfile -WindowStyle Hidden -EncodedCommand $encoded" -WindowStyle Hidden
