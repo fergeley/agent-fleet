@@ -257,7 +257,7 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
     $ids = @(Get-FleetJobIds $Manifest)
     $entries = @($Manifest.Jobs)
     if ($JobId -and $JobId -cnotin $ids) { throw "The Jobs ID is not configured: $JobId" }
-    $layout = Get-FleetJobsLayout $Manifest
+    [void](Get-FleetJobsLayout $Manifest)
     [void](Get-FleetTabColors $Manifest)
 
     # Validate full-manifest tab limits even when a single -Job filter is active.
@@ -281,8 +281,9 @@ function Get-FleetJobDefinitions($Manifest, [string]$JobId = '') {
             throw "The Jobs client is unsupported: $($entry.Client)"
         }
         if ($entry.Directory -isnot [string]) { throw "The Jobs directory is missing for $($entry.Id)." }
-        if ($layout -ceq 'SingleWindow' -and $entry.Directory.Contains(';')) {
-            throw "SingleWindow job directory cannot contain a semicolon: $($entry.Directory)"
+        # Both layouts pass the directory to Windows Terminal, which reads a semicolon as a command separator.
+        if ($entry.Directory.Contains(';')) {
+            throw "The Jobs directory for $($entry.Id) cannot contain a semicolon: $($entry.Directory)"
         }
         $tabName = Parse-FleetJobTab $entry $entry.Id
         $customArgs = Parse-FleetJobArgs $entry $entry.Id
@@ -360,6 +361,59 @@ function Get-FleetJobArguments([string]$PowerShellExecutable, [string]$OpenFleet
     return $argsList.ToArray()
 }
 
+# Callers check their arguments with this before they change anything, so that a refused launch leaves nothing behind.
+function Assert-FleetTerminalArgument([string[]]$Arguments) {
+    foreach ($argument in $Arguments) {
+        if ($argument.Contains('"')) { throw 'A Windows Terminal argument cannot contain a double quote.' }
+        if ($argument -cne ';' -and $argument.Contains(';')) { throw 'A Windows Terminal argument cannot contain a semicolon, because Windows Terminal reads it as a command separator.' }
+    }
+}
+
+function Start-FleetTerminal([string]$Terminal, [string[]]$Arguments) {
+    Assert-FleetTerminalArgument $Arguments
+    if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'FleetWindow.cs') }
+    # ArgumentList quotes each argument. A tab that wt.exe opens takes the environment of wt.exe,
+    # so give it the sign-in environment instead of the environment of the shell that ran Fleet.
+    $start = [Diagnostics.ProcessStartInfo]::new($Terminal)
+    $start.UseShellExecute = $false
+    foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+    $start.Environment.Clear()
+    foreach ($variable in [FleetWindow]::GetSignInEnvironment().GetEnumerator()) { $start.Environment[$variable.Key] = $variable.Value }
+    [Diagnostics.Process]::Start($start).Dispose()
+}
+
+# The Windows command line for these arguments, by the rules that CommandLineToArgvW and the C runtime use to split it.
+function ConvertTo-FleetCommandLine([string[]]$Arguments) {
+    $parts = foreach ($argument in $Arguments) {
+        if ($argument.Length -gt 0 -and $argument -notmatch '[\s"]') { $argument; continue }
+        $builder = [Text.StringBuilder]::new('"')
+        $backslashes = 0
+        foreach ($character in $argument.ToCharArray()) {
+            if ($character -eq [char]'\') { $backslashes++; continue }
+            if ($character -eq [char]'"') { [void]$builder.Append([char]'\', 2 * $backslashes + 1) }
+            elseif ($backslashes -gt 0) { [void]$builder.Append([char]'\', $backslashes) }
+            [void]$builder.Append($character)
+            $backslashes = 0
+        }
+        [void]$builder.Append([char]'\', 2 * $backslashes).Append([char]'"')
+        $builder.ToString()
+    }
+    $parts -join ' '
+}
+
+# The boot counter of Windows, or 'unknown'. It changes at every restart, so it tells a marker of an earlier boot from one of this boot.
+function Get-FleetBootId {
+    $bootId = try {
+        [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name BootId -ErrorAction Stop)
+    } catch { 'unknown' }
+    if ([string]::IsNullOrWhiteSpace($bootId)) { 'unknown' } else { $bootId }
+}
+
+function Get-FleetResetHint([string]$JobId, [string]$Profile = '') {
+    $profileArgument = if ($Profile) { " -Profile $Profile" } else { '' }
+    " When no window or client of that launch is still running, run: agent-fleet -Job $JobId -ResetPending$profileArgument"
+}
+
 function New-FleetJobPaneArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath, [string]$Title, [string]$Profile = '', [bool]$UseApplicationTitle = $true) {
     $titleFlag = if ($UseApplicationTitle) { '--useApplicationTitle' } else { '--suppressApplicationTitle' }
     @('--title', $Title, $titleFlag, '-d', $Job.Directory, $PowerShellExecutable) +
@@ -397,7 +451,9 @@ function New-FleetSingleWindowPlan([string]$PowerShellExecutable, [string]$OpenF
         }
 
         if ($tabIndex -eq 0) {
-            $terminalArgs.AddRange([string[]]@('-w', $windowName, '--maximized', 'new-tab'))
+            # No --maximized: Windows Terminal 1.25 often hung when its window changed size while it was still
+            # creating the panes of this command line. The launcher maximizes the window after every pane started.
+            $terminalArgs.AddRange([string[]]@('-w', $windowName, 'new-tab'))
         } else {
             $terminalArgs.Add(';')
             $terminalArgs.Add('new-tab')
@@ -597,10 +653,7 @@ function New-FleetInvocationRecord($Context, [string]$ContextPath, [string]$Runt
         $shellStartedAtUtc = $process.StartTime.ToUniversalTime().ToString('o')
         $sessionId = [int]$process.SessionId
     } finally { $process.Dispose() }
-    $bootId = try {
-        [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name BootId -ErrorAction Stop)
-    } catch { 'unknown' }
-    if ([string]::IsNullOrWhiteSpace($bootId)) { $bootId = 'unknown' }
+    $bootId = Get-FleetBootId
     $runtimeVersion = $null
     $releasePath = Join-Path $RuntimeDirectory 'release.json'
     if ([IO.File]::Exists($releasePath)) {

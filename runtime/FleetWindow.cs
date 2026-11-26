@@ -25,6 +25,12 @@ public static class FleetWindow
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
     [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("userenv.dll", SetLastError = true)] private static extern bool CreateEnvironmentBlock(out IntPtr environment, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)] private static extern bool DestroyEnvironmentBlock(IntPtr environment);
+    [DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
 
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct Rectangle { public int Left, Top, Right, Bottom; }
@@ -165,10 +171,12 @@ public static class FleetWindow
     public static int[] TileBounds(int[] area, int count, int index)
     {
         if (area == null || area.Length != 4 || area[2] < 1 || area[3] < 1) throw new ArgumentException("The work area must contain a positive width and height.");
-        if (count < 1 || count > 4) throw new ArgumentOutOfRangeException("count");
+        if (count < 1 || count > 16) throw new ArgumentOutOfRangeException("count");
         if (index < 0 || index >= count) throw new ArgumentOutOfRangeException("index");
-        int columns = count == 1 ? 1 : 2;
-        int rows = count > 2 ? 2 : 1;
+        // A manifest allows 16 job windows. Columns are the square root of the count, rounded up, which keeps the layouts of 1 to 4.
+        int columns = 1;
+        while (columns * columns < count) columns++;
+        int rows = (count + columns - 1) / columns;
         if (area[2] < columns || area[3] < rows) throw new ArgumentException("The work area is too small for this layout.");
         int column = index % columns;
         int row = index / columns;
@@ -189,6 +197,77 @@ public static class FleetWindow
             ShowWindowAsync(window, 4);
             return SetWindowPos(window, IntPtr.Zero, x, y, width, height, 0x4054);
         } finally { SetThreadDpiAwarenessContext(previous); }
+    }
+
+    // False when the thread of the window does not answer a WM_NULL within five seconds. Windows itself counts a window as hung
+    // after five seconds without messages, so a Terminal that is only busy for a moment still counts as responsive.
+    public static bool IsResponsive(long handle)
+    {
+        IntPtr result;
+        // SMTO_ABORTIFHUNG returns at once for a window that Windows already counts as hung.
+        return SendMessageTimeout(new IntPtr(handle), 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002, 5000, out result) != IntPtr.Zero;
+    }
+
+    // IsResponsive is also false for a window that closed, so a caller checks this first to tell closed from hung.
+    public static bool Exists(long handle)
+    {
+        return IsWindow(new IntPtr(handle));
+    }
+
+    // Place the window on the work area, then maximize it there, so that it stays maximized on the monitor under the pointer.
+    public static bool Fill(long handle, string property, int[] area)
+    {
+        if (area == null || area.Length != 4) return false;
+        if (!Place(handle, property, area[0], area[1], area[2], area[3])) return false;
+        return ShowWindowAsync(new IntPtr(handle), 3);
+    }
+
+    // The environment that Windows gives this user at sign-in, without the variables of the calling shell.
+    public static Dictionary<string, string> GetSignInEnvironment()
+    {
+        IntPtr token;
+        // TOKEN_QUERY | TOKEN_DUPLICATE, which CreateEnvironmentBlock needs for a primary token.
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0008 | 0x0002, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            IntPtr block;
+            if (!CreateEnvironmentBlock(out block, token, false)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                var variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                int offset = 0;
+                while (true) {
+                    string entry = Marshal.PtrToStringUni(IntPtr.Add(block, offset));
+                    if (String.IsNullOrEmpty(entry)) break;
+                    offset += (entry.Length + 1) * 2;
+                    int separator = entry.IndexOf('=');
+                    // An entry such as "=C:=C:\" holds a drive's current directory, not a variable.
+                    if (separator <= 0) continue;
+                    variables[entry.Substring(0, separator)] = entry.Substring(separator + 1);
+                }
+                if (variables.Count == 0) throw new InvalidOperationException("The sign-in environment is empty.");
+                // CreateEnvironmentBlock leaves some system values unexpanded, such as %ProgramFiles% in PSModulePath.
+                // Expand them from the block itself, as Explorer does for a new process.
+                foreach (var name in new List<string>(variables.Keys)) {
+                    string value = variables[name];
+                    if (value.IndexOf('%') < 0) continue;
+                    foreach (var reference in variables) {
+                        if (!String.Equals(reference.Key, name, StringComparison.OrdinalIgnoreCase))
+                            value = ReplaceIgnoreCase(value, "%" + reference.Key + "%", reference.Value);
+                    }
+                    variables[name] = value;
+                }
+                return variables;
+            } finally { DestroyEnvironmentBlock(block); }
+        } finally { CloseHandle(token); }
+    }
+
+    private static string ReplaceIgnoreCase(string text, string find, string replacement)
+    {
+        int start = text.IndexOf(find, StringComparison.OrdinalIgnoreCase);
+        while (start >= 0) {
+            text = text.Substring(0, start) + replacement + text.Substring(start + find.Length);
+            start = text.IndexOf(find, start + replacement.Length, StringComparison.OrdinalIgnoreCase);
+        }
+        return text;
     }
 
     public static bool Register(long handle, string property)

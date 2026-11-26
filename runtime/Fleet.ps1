@@ -54,14 +54,14 @@ if ($NewWorktree) {
     $repo = if ([string]::IsNullOrWhiteSpace($Repository)) { (Get-Location).Path } else { $Repository }
     $created = New-FleetWorktree -Repository $repo -Path $NewWorktree -BaseRef $BaseRef -Branch $Branch -Lock:$Lock -Manifest $manifestForOps -AllowWorktreeInclude:$AllowWorktreeInclude
     $created | ConvertTo-Json -Depth 5
-    return
+    exit 0
 }
 
 if ($CleanWorktree) {
     $cleanBase = if ($PSBoundParameters.ContainsKey('BaseRef')) { $BaseRef } else { '' }
     $cleaned = Remove-FleetWorktree -Path $CleanWorktree -BaseRef $cleanBase -InstallRoot $InstallRoot -DryRun:$DryRun -Force:$Force
     $cleaned | ConvertTo-Json -Depth 5
-    return
+    exit 0
 }
 
 if ($null -eq $manifestForOps) {
@@ -73,18 +73,18 @@ if ($OpenTab) {
     if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'FleetWindow.cs') }
     $opened = Invoke-FleetOpenTab -Manifest $manifest -InstallRoot $InstallRoot -Profile $Profile -Client $Client -Directory $Directory -Repository $Repository -Branch $Branch -BaseRef $BaseRef -TabTitle $TabTitle -TabColor $TabColor -ClientArgs $ClientArgs -Lock:$Lock -AllowWorktreeInclude:$AllowWorktreeInclude
     $opened | ConvertTo-Json -Depth 6
-    return
+    exit 0
 }
 
 if ($Dispatch) {
     $res = Invoke-FleetDispatch -Manifest $manifest -Client $Client -Directory $Directory -Prompt $Prompt -Model $Model -Name $Name -InstallRoot $InstallRoot -Profile $Profile
     $res | ConvertTo-Json -Depth 4
-    return
+    exit 0
 }
 if ($Queue) {
     $res = Invoke-FleetQueue -Manifest $manifest -Thread $Thread -Message $Message -Resume:$Resume
     $res | ConvertTo-Json -Depth 4
-    return
+    exit 0
 }
 
 if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'FleetWindow.cs') }
@@ -165,9 +165,23 @@ if ($Status) {
 
 if ($PrintPlan) {
     & (Join-Path $PSScriptRoot 'Open-Fleet.ps1') -PrintPlan -Job $Job -Profile $Profile -InstallRoot $InstallRoot -ManifestSnapshot $manifest
-    exit $LASTEXITCODE
+    exit 0
 }
 
 $outcome = Invoke-FleetJobBatch $manifest $Job ([bool]$ResetPending) ([bool]$Arrange) $stateDirectory $lockHash $InstallRoot $Profile
 $outcome | ConvertTo-Json -Depth 8
-if ($outcome.Result -in @('partial', 'error')) { exit 1 }
+if ($outcome.Result -in @('partial', 'error')) {
+    if ($Quiet) {
+        # A quiet launch, such as the Startup shortcut, has no console. A separate process shows the notice,
+        # so that the launch lock is not held while it waits for the person to close it.
+        try {
+            $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Format-FleetLaunchNotice $outcome $Profile)))
+            $popup = "`$null = (New-Object -ComObject WScript.Shell).Popup([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$text')), 0, 'Agent Fleet', 48)"
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($popup))
+            Start-Process -FilePath $manifest.PowerShell -ArgumentList "-NoLogo -NoProfile -WindowStyle Hidden -EncodedCommand $encoded" -WindowStyle Hidden
+        } catch { }
+    }
+    exit 1
+}
+# Without this, the caller reads the exit code of the last native command that this script ran.
+exit 0
