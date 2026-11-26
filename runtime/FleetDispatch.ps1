@@ -490,7 +490,7 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
     foreach ($arg in $resolvedArgs) { $wtArgs.Add($arg) }
 
     if (-not $PlanOnly) {
-        [void](Start-Process -FilePath $Manifest.Terminal -ArgumentList $wtArgs.ToArray())
+        Start-FleetTerminal $Manifest.Terminal $wtArgs.ToArray()
     }
     [pscustomobject]@{
         Result = if ($PlanOnly) { 'planned' } else { 'opened' }

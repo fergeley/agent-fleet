@@ -8,6 +8,16 @@ $runtimeRoot = Join-Path $repoRoot 'runtime'
 . (Join-Path $runtimeRoot 'FleetUpdate.ps1')
 if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $runtimeRoot 'FleetWindow.cs') }
 
+function Wait-TestReceiptArguments([string]$Path) {
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    while ($deadline.ElapsedMilliseconds -lt 15000) {
+        $lines = @(if (Test-Path -LiteralPath $Path) { Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue })
+        if ($lines.Count -ge 2) { return [string]$lines[1] }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "The stub wrote no receipt: $Path"
+}
+
 $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('agent-fleet-test-' + [Guid]::NewGuid().ToString('n'))
 [void][IO.Directory]::CreateDirectory($tmpRoot)
 
@@ -192,7 +202,7 @@ class Program {
         $receiptFile = Join-Path $fakeLocal 'AgentFleet/installation.json'
         $initManifestFile = Join-Path $fakeLocal 'AgentFleet/manifest.json'
         $rec = Get-Content -LiteralPath $receiptFile -Raw | ConvertFrom-Json
-        if ($rec.ReleaseVersion -cne '2.1.0' -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
+        if ($rec.ReleaseVersion -cne '2.1.1' -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
             throw "Install -Init receipt unexpected: $($rec | ConvertTo-Json)"
         }
 
@@ -341,6 +351,30 @@ class Program {
         throw 'Invoke-FleetOpenTab plan failed.'
     }
 
+    # Windows Terminal must receive each argument whole, also a title or a path with spaces.
+    $env:FLEET_PUBLIC_RECEIPT = Join-Path $tmpRoot 'terminal-receipt.txt'
+    try {
+        $openTab = Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Directory $wtFree -TabTitle 'Agent Fleet | free tab'
+        if ($openTab.Result -cne 'opened') { throw 'Invoke-FleetOpenTab did not open the tab.' }
+        $terminalArgs = Wait-TestReceiptArguments $env:FLEET_PUBLIC_RECEIPT
+        if (-not $terminalArgs.Contains("|--title|Agent Fleet | free tab|--suppressApplicationTitle|-d|$wtFree|")) {
+            throw "Windows Terminal did not receive the tab title as one argument: $terminalArgs"
+        }
+
+        Remove-Item -LiteralPath $env:FLEET_PUBLIC_RECEIPT
+        $sampleArgs = @('-w', 'new', 'new-tab', '--title', 'Agent Fleet Jobs | tag/nonce', '-d', 'C:\Program Files\', ';', 'split-pane', '')
+        Start-FleetTerminal $stubExe $sampleArgs
+        $terminalArgs = Wait-TestReceiptArguments $env:FLEET_PUBLIC_RECEIPT
+        if ($terminalArgs -cne ($sampleArgs -join '|')) { throw "Start-FleetTerminal changed the arguments: $terminalArgs" }
+    } finally {
+        Remove-Item Env:FLEET_PUBLIC_RECEIPT -ErrorAction SilentlyContinue
+    }
+    foreach ($badArg in @('say "hi"', 'a;b')) {
+        $refusedArg = $false
+        try { Start-FleetTerminal $stubExe @('--title', $badArg) } catch { $refusedArg = $true }
+        if (-not $refusedArg) { throw "Start-FleetTerminal accepted an argument that Windows Terminal reads differently: $badArg" }
+    }
+
     # Remove-FleetWorktree guards: main repo, configured job, CWD, dirty tree, unmerged commit.
     foreach ($refusalTarget in @($gitRepo, $workers[0])) {
         $refused = $false
@@ -405,7 +439,7 @@ class Program {
         return Get-Content -LiteralPath (Join-Path $runtimeRoot $relName) -Raw
     }
     $bootRes = Invoke-FleetRemoteBootstrap -Repo 'fergeley/agent-fleet' -Branch 'main' -StageRoot $bootStageGood -RunInstaller:$false
-    if ($bootRes.Result -cne 'staged' -or $bootRes.Version -cne '2.1.0') { throw 'install.ps1 valid verification failed.' }
+    if ($bootRes.Result -cne 'staged' -or $bootRes.Version -cne '2.1.1') { throw 'install.ps1 valid verification failed.' }
 
     function Invoke-FleetBootstrapFetch([string]$Uri, [string]$Accept) {
         if ($Uri -like '*/commits/main') { return (@{ sha = ('d' * 40) } | ConvertTo-Json) }

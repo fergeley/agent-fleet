@@ -360,6 +360,16 @@ function Get-FleetJobArguments([string]$PowerShellExecutable, [string]$OpenFleet
     return $argsList.ToArray()
 }
 
+function Start-FleetTerminal([string]$Terminal, [string[]]$Arguments) {
+    # Start-Process joins an argument array with spaces and adds no quotes, so quote each argument here.
+    $quoted = foreach ($argument in $Arguments) {
+        if ($argument.Contains('"')) { throw 'A Windows Terminal argument cannot contain a double quote.' }
+        if ($argument -cne ';' -and $argument.Contains(';')) { throw 'A Windows Terminal argument cannot contain a semicolon, because Windows Terminal reads it as a command separator.' }
+        if ($argument.Length -eq 0 -or $argument -match '\s') { '"' + ($argument -replace '(\\+)$', '$1$1') + '"' } else { $argument }
+    }
+    [void](Start-Process -FilePath $Terminal -ArgumentList ($quoted -join ' '))
+}
+
 function New-FleetJobPaneArguments([string]$PowerShellExecutable, [string]$OpenFleetPath, [string]$InstallRoot, $Job, [string]$ContextPath, [string]$Title, [string]$Profile = '', [bool]$UseApplicationTitle = $true) {
     $titleFlag = if ($UseApplicationTitle) { '--useApplicationTitle' } else { '--suppressApplicationTitle' }
     @('--title', $Title, $titleFlag, '-d', $Job.Directory, $PowerShellExecutable) +

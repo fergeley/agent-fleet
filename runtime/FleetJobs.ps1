@@ -698,7 +698,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
                 Write-FleetJobState $jobPlan.StatePath $ev
             }
             try {
-                [void](Start-Process -FilePath $Manifest.Terminal -ArgumentList $plan.Arguments)
+                Start-FleetTerminal $Manifest.Terminal $plan.Arguments
             } catch {
                 foreach ($jobPlan in $toOpen) {
                     if (Test-Path -LiteralPath $jobPlan.StatePath) { Remove-Item -LiteralPath $jobPlan.StatePath }
@@ -756,7 +756,7 @@ function Invoke-FleetJobBatch($Manifest, [string]$JobId, [bool]$ResetPending, [b
         Write-FleetJobState $jobPlan.StatePath $ev
         $paneArgs = @('-w', $windowName, 'new-tab') + (New-FleetJobPaneArguments $Manifest.PowerShell $openFleetPath $InstallRoot $jobPlan $jobPlan.ContextPath $title $Profile $true)
         try {
-            [void](Start-Process -FilePath $Manifest.Terminal -ArgumentList $paneArgs)
+            Start-FleetTerminal $Manifest.Terminal $paneArgs
         } catch {
             if (Test-Path -LiteralPath $jobPlan.StatePath) { Remove-Item -LiteralPath $jobPlan.StatePath }
             $byId[$jobPlan.Id].Result = 'blocked'
