@@ -84,8 +84,23 @@ Add `~/.local/bin` to your `PATH`, then run `agent-fleet` (or `fleet`).
 - `agent-fleet -Dispatch -Client Claude|Codex -Directory <dir> -Prompt "<task>"`: Start a background session (`claude --bg` or `codex exec --json`).
 - `agent-fleet -Queue -Thread <id-or-name> -Message "<text>" [-Resume]`: Queue a follow-up instruction (`codex queue`).
 - `agent-fleet -Update` / `-Rollback` / `-AutoUpdate On|Off`: Manage signed SHA-256 runtime updates over public GitHub HTTPS (Protocol 2).
+- `agent-fleet -Arrange`: Move the open job windows back to their tiles, or the shared window back to the monitor under the pointer.
+- `agent-fleet -Job <id> -ResetPending`: Clear the pending launch of one job. Run it only when no window or client of that launch is still running.
+
+## How a Windows launch behaves
+
+- **Environment.** Panes and clients start with your Windows sign-in environment, plus the `Env` of their job. Variables of the shell that ran `agent-fleet` do not reach them. For example, `NO_COLOR=1` from an agent or editor terminal does not turn off color in your clients. To give a variable to a client, put it in the job's `Env` or in your Windows user environment.
+- **Window size.** Fleet moves or maximizes a window only after every pane in it has started. Windows Terminal 1.25 often stopped responding when its window changed size while it was still creating panes. The shared `SingleWindow` window then fills the monitor under the pointer.
+- **Pending launches.** Fleet records a pending launch before it opens a window, and a pending launch blocks its job until Fleet finds that window. At the next launch after a restart, Fleet moves a pending launch of an earlier boot to `state\retired`, because a restart closes every window. A pending launch of the current boot keeps blocking its job, and the message names the `-ResetPending` command.
+- **A frozen Terminal.** When Windows Terminal stops responding, Fleet reports the job as blocked instead of focusing the frozen window. Close the window. If it does not close, end `WindowsTerminal.exe` in Task Manager, which closes every Terminal window.
+- **Result.** `agent-fleet` exits with 0 when every job opened or was open, and with 1 when a job is blocked. A launch from the desktop or Startup shortcut shows a notice that lists the blocked jobs.
+
+### Upgrading from 2.1.0
+
+Version 2.1.0 could not open its window, so its daily update check never ran. Run `agent-fleet -Update` once, or install again. A pending launch that 2.1.0 left has no boot record, so it still blocks its job after the update: close any window of that launch, then run the `-ResetPending` command that the message names.
 
 ## Verification
 
 - Windows: `pwsh -NoLogo -NoProfile -File tests/Test-Fleet.ps1`
+- Windows desktop with Windows Terminal: `pwsh -NoLogo -NoProfile -File tests/Test-NativeLaunch.ps1`. It opens and closes Terminal windows of a temporary installation and runs a small PowerShell probe in place of each client. GitHub Actions cannot run it, because its runners have no desktop session with Windows Terminal.
 - macOS / Linux: `python3 -m unittest discover -s unix -p "test_*.py" -v`

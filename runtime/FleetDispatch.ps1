@@ -402,7 +402,9 @@ function Invoke-FleetOpenTab($Manifest, [string]$InstallRoot, [string]$Profile =
     if ([string]::IsNullOrWhiteSpace($BaseRef) -or $BaseRef.Trim().StartsWith('-', [StringComparison]::Ordinal)) {
         throw "Invalid BaseRef: $BaseRef"
     }
-    $resolvedArgs = @(Get-FleetClientArguments $Client $ClientArgs)
+    # Get-FleetClientArguments returns its array as one object. Assign it as it is: @() would nest it, and the
+    # nested array would reach Windows Terminal as one argument.
+    $resolvedArgs = Get-FleetClientArguments $Client $ClientArgs
     foreach ($a in $resolvedArgs) {
         if ($a.Contains(';')) { throw 'Client arguments passed to -OpenTab cannot contain a semicolon.' }
     }
@@ -723,7 +725,8 @@ function Invoke-FleetDispatch($Manifest, [string]$Client, [string]$Directory, [s
         $codexArgs.Add($Model)
     }
     $codexArgs.Add($Prompt)
-    $proc = Start-Process -FilePath $executable -ArgumentList $codexArgs.ToArray() -WorkingDirectory $Directory -WindowStyle Hidden -PassThru -RedirectStandardOutput $logPath -RedirectStandardError $errPath
+    # Start-Process joins an argument array without quotes, so a prompt with spaces would reach Codex as several arguments.
+    $proc = Start-Process -FilePath $executable -ArgumentList (ConvertTo-FleetCommandLine $codexArgs.ToArray()) -WorkingDirectory $Directory -WindowStyle Hidden -PassThru -RedirectStandardOutput $logPath -RedirectStandardError $errPath
     [pscustomobject]@{
         Result = 'dispatched'
         Client = 'Codex'

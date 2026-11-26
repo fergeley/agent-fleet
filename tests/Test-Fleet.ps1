@@ -8,14 +8,22 @@ $runtimeRoot = Join-Path $repoRoot 'runtime'
 . (Join-Path $runtimeRoot 'FleetUpdate.ps1')
 if (-not ('FleetWindow' -as [type])) { Add-Type -Path (Join-Path $runtimeRoot 'FleetWindow.cs') }
 
-function Wait-TestReceiptArguments([string]$Path) {
+function Clear-TestStubRun([string]$StubExe) {
+    $record = Join-Path (Split-Path -Parent $StubExe) 'last-run.json'
+    if (Test-Path -LiteralPath $record) { Remove-Item -LiteralPath $record }
+}
+
+# The record that the stub wrote for its next run after Clear-TestStubRun.
+function Wait-TestStubRun([string]$StubExe) {
+    $record = Join-Path (Split-Path -Parent $StubExe) 'last-run.json'
     $deadline = [Diagnostics.Stopwatch]::StartNew()
     while ($deadline.ElapsedMilliseconds -lt 15000) {
-        $lines = @(if (Test-Path -LiteralPath $Path) { Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue })
-        if ($lines.Count -ge 2) { return [string]$lines[1] }
+        # The stub can still be writing the file, so read it again until it parses.
+        $parsed = try { [IO.File]::ReadAllText($record) | ConvertFrom-Json } catch { $null }
+        if ($parsed) { return $parsed }
         Start-Sleep -Milliseconds 100
     }
-    throw "The stub wrote no receipt: $Path"
+    throw "The stub wrote no record: $record"
 }
 
 $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('agent-fleet-test-' + [Guid]::NewGuid().ToString('n'))
@@ -44,8 +52,15 @@ try {
     [IO.File]::WriteAllText((Join-Path $stubRoot 'Program.cs'), @'
 using System;
 using System.IO;
+using System.Text.Json;
 class Program {
     static int Main(string[] args) {
+        // Written on every run, beside the stub, so that a run with the sign-in environment also leaves a record.
+        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "last-run.json"), JsonSerializer.Serialize(new {
+            Args = args,
+            CallerOnly = Environment.GetEnvironmentVariable("FLEET_CALLER_ONLY"),
+            UserProfile = Environment.GetEnvironmentVariable("USERPROFILE")
+        }));
         if (args.Length == 3 && args[0] == "agents" && args[1] == "--json" && args[2] == "--all") {
             Console.WriteLine("[{\"id\":\"bg-1\",\"status\":\"working\",\"cwd\":\"C:\\\\work\"}]");
             return 0;
@@ -157,9 +172,16 @@ class Program {
     if ($cDisp.Result -cne 'dispatched' -or $cDisp.Output -notmatch '--bg --model sonnet --name s1 fix tests') {
         throw 'Invoke-FleetDispatch Claude failed.'
     }
-    $xDisp = Invoke-FleetDispatch -Manifest $manifest -Client Codex -Directory $workers[0] -Prompt 'audit' -Model 'gpt-5' -InstallRoot $installRoot
+    Clear-TestStubRun $stubExe
+    $codexPrompt = 'audit the "login" flow in C:\src\ and report'
+    $xDisp = Invoke-FleetDispatch -Manifest $manifest -Client Codex -Directory $workers[0] -Prompt $codexPrompt -Model 'gpt-5' -InstallRoot $installRoot
+    $codexRun = Wait-TestStubRun $stubExe
     if ($xDisp.Result -cne 'dispatched' -or -not (Test-Path -LiteralPath $xDisp.LogPath)) {
         throw 'Invoke-FleetDispatch Codex failed.'
+    }
+    $expectedCodexArgs = @('exec', '-C', $workers[0], '--json', '-m', 'gpt-5', $codexPrompt)
+    if ((@($codexRun.Args) -join '|') -cne ($expectedCodexArgs -join '|') -or @($codexRun.Args).Count -ne $expectedCodexArgs.Count) {
+        throw "Invoke-FleetDispatch Codex changed its arguments: $(@($codexRun.Args) -join '|')"
     }
     $qRes = Invoke-FleetQueue -Manifest $manifest -Thread 't-1' -Message 'continue' -Resume
     if ($qRes.Result -cne 'queued' -or $qRes.Output -notmatch 'queue --thread t-1 --message continue --resume') {
@@ -351,29 +373,126 @@ class Program {
         throw 'Invoke-FleetOpenTab plan failed.'
     }
 
-    # Windows Terminal must receive each argument whole, also a title or a path with spaces.
-    $env:FLEET_PUBLIC_RECEIPT = Join-Path $tmpRoot 'terminal-receipt.txt'
+    # Windows Terminal gets each argument whole, and the sign-in environment instead of the variables of the calling shell.
+    $env:FLEET_CALLER_ONLY = 'leaked-from-caller'
     try {
+        Clear-TestStubRun $stubExe
         $openTab = Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Directory $wtFree -TabTitle 'Agent Fleet | free tab'
         if ($openTab.Result -cne 'opened') { throw 'Invoke-FleetOpenTab did not open the tab.' }
-        $terminalArgs = Wait-TestReceiptArguments $env:FLEET_PUBLIC_RECEIPT
-        if (-not $terminalArgs.Contains("|--title|Agent Fleet | free tab|--suppressApplicationTitle|-d|$wtFree|")) {
-            throw "Windows Terminal did not receive the tab title as one argument: $terminalArgs"
+        $run = Wait-TestStubRun $stubExe
+        $joined = @($run.Args) -join '|'
+        if (-not $joined.Contains((@('--title', 'Agent Fleet | free tab', '--suppressApplicationTitle', '-d', $wtFree, $stubExe) -join '|'))) {
+            throw "Windows Terminal did not receive the tab title as one argument: $joined"
+        }
+        if ($run.CallerOnly) { throw 'Windows Terminal received a variable of the calling shell.' }
+        if (-not $run.UserProfile) { throw 'Windows Terminal did not receive the sign-in environment.' }
+
+        Clear-TestStubRun $stubExe
+        $openArgsTab = Invoke-FleetOpenTab -Manifest $multiManifest -InstallRoot $installRoot -Client Antigravity -Directory $wtFree -TabTitle 'args' -ClientArgs @('-File', 'C:\with space\x.ps1', '-Flag')
+        if ($openArgsTab.Result -cne 'opened') { throw 'Invoke-FleetOpenTab with client arguments did not open the tab.' }
+        $run = Wait-TestStubRun $stubExe
+        if (((@($run.Args) | Select-Object -Last 4) -join '|') -cne (@($stubExe, '-File', 'C:\with space\x.ps1', '-Flag') -join '|')) {
+            throw "Invoke-FleetOpenTab did not pass each client argument separately: $(@($run.Args) -join '|')"
         }
 
-        Remove-Item -LiteralPath $env:FLEET_PUBLIC_RECEIPT
-        $sampleArgs = @('-w', 'new', 'new-tab', '--title', 'Agent Fleet Jobs | tag/nonce', '-d', 'C:\Program Files\', ';', 'split-pane', '')
+        $sampleArgs = @('-w', 'new', 'new-tab', '--title', 'Agent Fleet Jobs | tag/nonce', '-d', 'C:\Program Files\', ';', 'split-pane', '', 'C:\a b\\')
+        Clear-TestStubRun $stubExe
         Start-FleetTerminal $stubExe $sampleArgs
-        $terminalArgs = Wait-TestReceiptArguments $env:FLEET_PUBLIC_RECEIPT
-        if ($terminalArgs -cne ($sampleArgs -join '|')) { throw "Start-FleetTerminal changed the arguments: $terminalArgs" }
+        $run = Wait-TestStubRun $stubExe
+        if ((@($run.Args) -join '|') -cne ($sampleArgs -join '|') -or @($run.Args).Count -ne $sampleArgs.Count) {
+            throw "Start-FleetTerminal changed the arguments: $(@($run.Args) -join '|')"
+        }
     } finally {
-        Remove-Item Env:FLEET_PUBLIC_RECEIPT -ErrorAction SilentlyContinue
+        Remove-Item Env:FLEET_CALLER_ONLY -ErrorAction SilentlyContinue
     }
     foreach ($badArg in @('say "hi"', 'a;b')) {
         $refusedArg = $false
         try { Start-FleetTerminal $stubExe @('--title', $badArg) } catch { $refusedArg = $true }
         if (-not $refusedArg) { throw "Start-FleetTerminal accepted an argument that Windows Terminal reads differently: $badArg" }
     }
+
+    # A command line from ConvertTo-FleetCommandLine splits back into the same arguments.
+    $hardArgs = @('exec', 'fix the "login" bug', 'C:\path with space\', 'trail\\', 'quote\"inside', '', "two`nlines", "tab`there", 'plain', '\\server\share\', 'ünïcødé ✓', '"')
+    Clear-TestStubRun $stubExe
+    Start-Process -FilePath $stubExe -ArgumentList (ConvertTo-FleetCommandLine $hardArgs) -WindowStyle Hidden -Wait
+    $run = Wait-TestStubRun $stubExe
+    for ($i = 0; $i -lt $hardArgs.Count; $i++) {
+        if (@($run.Args).Count -ne $hardArgs.Count -or [string]@($run.Args)[$i] -cne $hardArgs[$i]) {
+            throw "ConvertTo-FleetCommandLine did not keep argument ${i}: $(@($run.Args) | ConvertTo-Json -Compress)"
+        }
+    }
+
+    # Every [FleetWindow] call in the runtime matches a method of FleetWindow.cs by name and argument count.
+    $windowMethods = @{}
+    foreach ($method in [FleetWindow].GetMethods([Reflection.BindingFlags]'Public, Static')) {
+        if (-not $windowMethods.ContainsKey($method.Name)) { $windowMethods[$method.Name] = [Collections.Generic.List[int]]::new() }
+        $windowMethods[$method.Name].Add($method.GetParameters().Count)
+    }
+    $badCalls = foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -Filter '*.ps1') {
+        $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+        $calls = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Static -and
+            $node.Expression -is [Management.Automation.Language.TypeExpressionAst] -and $node.Expression.TypeName.Name -ceq 'FleetWindow' }, $true)
+        foreach ($call in $calls) {
+            $count = if ($call.Arguments) { $call.Arguments.Count } else { 0 }
+            if (-not $windowMethods.ContainsKey($call.Member.Value) -or $count -notin $windowMethods[$call.Member.Value]) {
+                "$($file.Name):$($call.Extent.StartLineNumber) [FleetWindow]::$($call.Member.Value) with $count arguments"
+            }
+        }
+    }
+    if ($badCalls) { throw "FleetWindow calls that match no method: $($badCalls -join '; ')" }
+
+    # Placement binds to the C# methods for every layout that Fleet uses. A handle of 0 has no property, so nothing moves.
+    $workArea = [int[]]@(0, 0, 1000, 800)
+    if (([FleetWindow]::TileBounds($workArea, 4, 3) -join ',') -cne '500,400,500,400') { throw 'TileBounds placed the fourth tile wrongly.' }
+    foreach ($count in 1..4) {
+        foreach ($index in 0..($count - 1)) {
+            if (Move-FleetWindowToTile 0 'AgentFleet.test.none' $workArea $count $index $false) { throw 'A window without the property was moved.' }
+        }
+    }
+    if (Move-FleetWindowToTile 0 'AgentFleet.test.none' $workArea 1 0 $true) { throw 'A shared window without the property was moved.' }
+
+    # A pending marker of an earlier boot is set aside. One of this boot, one without a boot ID, or an unknown one stays.
+    $bootState = Join-Path $tmpRoot 'boot-state'
+    [void][IO.Directory]::CreateDirectory($bootState)
+    $currentBoot = Get-FleetBootId
+    $markerBoots = [ordered]@{ 'job-old' = "earlier-$currentBoot"; 'job-now' = $currentBoot; 'job-legacy' = $null; 'job-unknown' = 'unknown' }
+    foreach ($entry in $markerBoots.GetEnumerator()) {
+        $marker = [ordered]@{ Id = $entry.Key; Title = "Agent Fleet Jobs | test/$($entry.Key)"; InstanceProperty = "AgentFleet.test.Instance.$($entry.Key)"; WindowProperty = "AgentFleet.test.Window.$($entry.Key)" }
+        if ($null -ne $entry.Value) { $marker.BootId = $entry.Value }
+        [IO.File]::WriteAllText((Join-Path $bootState "job-$($entry.Key).pending.json"), ($marker | ConvertTo-Json))
+    }
+    $movedMarkers = @(Move-FleetEarlierBootPendingMarkers $bootState)
+    $remaining = @(Get-ChildItem -LiteralPath $bootState -Filter 'job-*.pending.json' -File | ForEach-Object Name | Sort-Object)
+    if ($currentBoot -ceq 'unknown') {
+        if ($movedMarkers.Count -ne 0 -or $remaining.Count -ne 4) { throw 'A pending marker was set aside although the boot is unknown.' }
+    } else {
+        if (($movedMarkers -join ',') -cne 'job-old' -or ($remaining -join ',') -cne 'job-job-legacy.pending.json,job-job-now.pending.json,job-job-unknown.pending.json' -or
+            @(Get-ChildItem -LiteralPath (Join-Path $bootState 'retired') -Filter 'job-job-old.pending.*.json').Count -ne 1) {
+            throw "Earlier-boot markers were not set aside exactly: moved $($movedMarkers -join ','); left $($remaining -join ',')"
+        }
+    }
+
+    # The launcher waits for the invocation record of each pane before it moves a window, and names the panes that wrote none.
+    $paneState = Join-Path $tmpRoot 'pane-state'
+    [void][IO.Directory]::CreateDirectory($paneState)
+    $paneA = [pscustomobject]@{ Id = 'job-a'; Nonce = 'a' * 32 }
+    $paneB = [pscustomobject]@{ Id = 'job-b'; Nonce = 'b' * 32 }
+    [IO.File]::WriteAllText((Join-Path $paneState "invocation-$($paneA.Nonce)-1.json"), '{}')
+    $stillWaiting = @(Wait-FleetPanesStarted $paneState @($paneA, $paneB) 300)
+    if ($stillWaiting.Count -ne 1 -or $stillWaiting[0].Id -cne 'job-b') { throw 'Wait-FleetPanesStarted did not name the pane without an invocation record.' }
+    [IO.File]::WriteAllText((Join-Path $paneState "invocation-$($paneB.Nonce)-1.json"), '{}')
+    if (@(Wait-FleetPanesStarted $paneState @($paneA, $paneB) 300).Count -ne 0) { throw 'Wait-FleetPanesStarted waited for panes that started.' }
+    if ([FleetWindow]::IsResponsive(0)) { throw 'IsResponsive reported a window that does not exist as responsive.' }
+    if (@($planSingle.Windows[0].Arguments) -contains '--maximized') { throw 'The SingleWindow command line asks Windows Terminal to maximize while it creates the panes.' }
+
+    # A blocked job names the command that clears it, and a quiet launch lists only the jobs that did not open.
+    if ((Get-FleetResetHint 'job-1') -notmatch 'run: agent-fleet -Job job-1 -ResetPending$') { throw 'The reset hint names the wrong command.' }
+    if ((Get-FleetResetHint 'job-1' 'work') -notmatch 'run: agent-fleet -Job job-1 -ResetPending -Profile work$') { throw 'The reset hint lacks the profile.' }
+    $noticeText = Format-FleetLaunchNotice ([pscustomobject]@{ Result = 'partial'; Jobs = @(
+        [pscustomobject]@{ Id = 'job-1'; Result = 'blocked'; Message = 'Blocked here.' },
+        [pscustomobject]@{ Id = 'job-2'; Result = 'launched'; Message = 'Opened.' }) })
+    if ($noticeText -notmatch 'job-1: Blocked here\.' -or $noticeText -match 'job-2') { throw "The launch notice lists the wrong jobs: $noticeText" }
+    Write-Output 'PASS: Terminal arguments and sign-in environment, command-line quoting, FleetWindow call shapes, placement, earlier-boot markers, and recovery text.'
 
     # Remove-FleetWorktree guards: main repo, configured job, CWD, dirty tree, unmerged commit.
     foreach ($refusalTarget in @($gitRepo, $workers[0])) {

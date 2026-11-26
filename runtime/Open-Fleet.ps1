@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$PrintPlan,
     [ValidateSet('None', 'Codex', 'Antigravity', 'Claude', 'OpenCode')]
     [string]$Pane = 'None',
@@ -50,7 +50,7 @@ if ($Pane -ne 'None') {
         if (Test-FleetProperty $context 'NativeArguments') {
             [string[]]$nativeArgs = @($context.NativeArguments)
         } else {
-            [string[]]$nativeArgs = @(Get-FleetClientArguments $context.Client)
+            [string[]]$nativeArgs = Get-FleetClientArguments $context.Client
         }
         if ((Test-FleetProperty $context 'NativeEnv') -and $null -ne $context.NativeEnv) {
             foreach ($prop in $context.NativeEnv.PSObject.Properties) {
