@@ -34,6 +34,14 @@ param(
     [string]$Thread = '',
     [string]$Message = '',
     [switch]$Resume,
+    [switch]$InstallNotifications,
+    [switch]$UninstallNotifications,
+    [switch]$TestNotifications,
+    [switch]$StatusNotifications,
+    [switch]$MuteNotifications,
+    [switch]$UnmuteNotifications,
+    [switch]$ProbeNotifications,
+    [string]$ConfigRoot = '',
     [string]$InstallRoot = $PSScriptRoot
 )
 
@@ -46,6 +54,55 @@ if ($Watch -and $Json) { Write-Error '-Watch cannot be combined with -Json.' -Er
 . (Join-Path $PSScriptRoot 'FleetDispatch.ps1')
 . (Join-Path $PSScriptRoot 'FleetJobs.ps1')
 Assert-FleetProfileName $Profile
+
+$notificationCommands = @(
+    [bool]$InstallNotifications, [bool]$UninstallNotifications, [bool]$TestNotifications,
+    [bool]$StatusNotifications, [bool]$MuteNotifications, [bool]$UnmuteNotifications, [bool]$ProbeNotifications
+) | Where-Object { $_ }
+if ($notificationCommands.Count -gt 1) { throw 'Choose one notification command at a time.' }
+if ($notificationCommands.Count -eq 1) {
+    . (Join-Path $PSScriptRoot 'FleetNotifyInstall.ps1')
+    $notifyRoot = Get-FleetNotifyRoot $InstallRoot
+    if ($InstallNotifications) {
+        $result = Install-FleetNotifyHooks -InstallRoot $InstallRoot -ConfigRoot $ConfigRoot -DryRun:$DryRun
+        $result | ConvertTo-Json -Depth 8
+        exit 0
+    }
+    if ($UninstallNotifications) {
+        $result = Uninstall-FleetNotifyHooks -InstallRoot $InstallRoot -ConfigRoot $ConfigRoot -DryRun:$DryRun
+        $result | ConvertTo-Json -Depth 8
+        exit 0
+    }
+    if ($TestNotifications) {
+        $result = Test-FleetNotifySounds -InstallRoot $InstallRoot -LogOnly:$DryRun
+        foreach ($item in @($result)) { Write-Output "$($item.Client) $($item.Event): $($item.Sound)" }
+        exit 0
+    }
+    if ($StatusNotifications) {
+        $notificationStatus = Get-FleetNotifyStatus -InstallRoot $InstallRoot -ConfigRoot $ConfigRoot
+        Write-Output "Notifications: installed=$($notificationStatus.Installed), muted=$($notificationStatus.Muted), root=$($notificationStatus.Root)"
+        foreach ($name in @('Claude', 'Codex', 'Antigravity', 'OpenCode')) {
+            Write-Output "  $name hooks: $($notificationStatus.Hooks.$name)"
+        }
+        if (@($notificationStatus.Log).Count -gt 0) {
+            Write-Output 'Recent events:'
+            foreach ($line in @($notificationStatus.Log)) { Write-Output "  $line" }
+        }
+        exit 0
+    }
+    if ($MuteNotifications -or $UnmuteNotifications) {
+        $result = Set-FleetNotifyMuted -InstallRoot $InstallRoot -Muted:([bool]$MuteNotifications)
+        $result | ConvertTo-Json -Depth 3
+        exit 0
+    }
+    if ($ProbeNotifications) {
+        [void][IO.Directory]::CreateDirectory($notifyRoot)
+        $probePath = Join-Path $notifyRoot 'notify-probe.jsonl'
+        Write-Output "Raw hook payloads are appended to: $probePath"
+        Write-Output 'Add a temporary hook that calls FleetNotify.ps1 with -Probe, trigger one approval, then inspect the file.'
+        exit 0
+    }
+}
 
 $manifestPath = Get-FleetManifestPath $InstallRoot $Profile
 $manifestForOps = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } else { $null }

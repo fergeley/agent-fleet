@@ -290,6 +290,7 @@ if (-not $ownedInstall) { Write-FleetUpdateJson $receiptPath $receipt }
 New-Item -ItemType Directory -Path $stateTarget -Force | Out-Null
 New-Item -ItemType Directory -Path $commandDirectory -Force | Out-Null
 $receipt.RuntimeDirectory = Publish-FleetGeneration -InstallRoot $installRoot -SourceRoot $sourceRoot -Release $release
+Publish-FleetNotifyFiles -InstallRoot $installRoot -SourceRoot $sourceRoot -Release $release
 foreach ($file in @('FleetUpdate.ps1','Start-Fleet.ps1')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $file) -Destination (Join-Path $installRoot $file) -Force
 }

@@ -22,6 +22,9 @@ jobs:
       - name: Run Windows Agent Fleet tests
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -File tests/Test-Fleet.ps1
+      - name: Run notification tests
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -File tests/Test-Notify.ps1
 
   unix:
     strategy:
