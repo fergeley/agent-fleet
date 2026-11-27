@@ -173,9 +173,34 @@ class Program {
     }
 
     $wt5 = Join-Path $tmpRoot 'wt-new-5'
-    $wtRes = New-FleetWorktree -Repository $gitRepo -Path $wt5 -BaseRef HEAD -Branch 'feat/public-test' -Lock
+    $wtUnlocked = Join-Path $tmpRoot 'wt-new-unlocked'
+    $hooks = Join-Path $tmpRoot 'checkout-hooks'
+    [void][IO.Directory]::CreateDirectory($hooks)
+    $checkoutHook = @'
+#!/bin/sh
+if test -f "$(git rev-parse --git-path locked)"; then
+    printf locked >lock-at-checkout
+else
+    printf unlocked >lock-at-checkout
+fi
+'@
+    [IO.File]::WriteAllText((Join-Path $hooks 'post-checkout'), $checkoutHook.Replace("`r`n", "`n") + "`n")
+    & git -C $gitRepo config core.hooksPath $hooks
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure the fixture checkout hook.' }
+    try {
+        $wtRes = New-FleetWorktree -Repository $gitRepo -Path $wt5 -BaseRef HEAD -Branch 'feat/public-test' -Lock
+        $unlockedRes = New-FleetWorktree -Repository $gitRepo -Path $wtUnlocked -BaseRef HEAD
+    } finally {
+        & git -C $gitRepo config --unset core.hooksPath
+    }
     if ($wtRes.Result -cne 'created' -or -not $wtRes.Locked -or -not (Test-Path -LiteralPath $wt5)) {
         throw 'New-FleetWorktree failed.'
+    }
+    if ((Get-Content -LiteralPath (Join-Path $wt5 'lock-at-checkout') -Raw) -cne 'locked') {
+        throw 'The new worktree was unlocked at checkout despite -Lock.'
+    }
+    if ($unlockedRes.Locked -or (Get-Content -LiteralPath (Join-Path $wtUnlocked 'lock-at-checkout') -Raw) -cne 'unlocked') {
+        throw 'The new worktree was locked without -Lock.'
     }
     $cDisp = Invoke-FleetDispatch -Manifest $manifest -Client Claude -Directory $workers[1] -Prompt 'fix tests' -Model 'sonnet' -Name 's1' -InstallRoot $installRoot
     if ($cDisp.Result -cne 'dispatched' -or $cDisp.Output -notmatch '--bg --model sonnet --name s1 fix tests') {
