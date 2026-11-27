@@ -38,7 +38,15 @@ param(
     [string]$Name = '',
     [string]$Thread = '',
     [string]$Message = '',
-    [switch]$Resume
+    [switch]$Resume,
+    [switch]$InstallNotifications,
+    [switch]$UninstallNotifications,
+    [switch]$TestNotifications,
+    [switch]$StatusNotifications,
+    [switch]$MuteNotifications,
+    [switch]$UnmuteNotifications,
+    [switch]$ProbeNotifications,
+    [string]$ConfigRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,6 +139,20 @@ try {
             $result | ConvertTo-Json -Depth 4
             if ($result.Result -eq 'error') { exit 1 }
             return
+        }
+        $notificationArgs = @{}
+        if ($InstallNotifications) { $notificationArgs.InstallNotifications = $true }
+        if ($UninstallNotifications) { $notificationArgs.UninstallNotifications = $true }
+        if ($TestNotifications) { $notificationArgs.TestNotifications = $true }
+        if ($StatusNotifications) { $notificationArgs.StatusNotifications = $true }
+        if ($MuteNotifications) { $notificationArgs.MuteNotifications = $true }
+        if ($UnmuteNotifications) { $notificationArgs.UnmuteNotifications = $true }
+        if ($ProbeNotifications) { $notificationArgs.ProbeNotifications = $true }
+        if ($notificationArgs.Count -gt 0) {
+            if ($ConfigRoot) { $notificationArgs.ConfigRoot = $ConfigRoot }
+            if ($DryRun) { $notificationArgs.DryRun = $true }
+            & (Join-Path $runtime 'Fleet.ps1') -InstallRoot $installRoot @notificationArgs
+            exit $LASTEXITCODE
         }
         if ($NewWorktree -or $CleanWorktree -or $OpenTab -or $Dispatch -or $Queue) {
             $opArgs = @{}

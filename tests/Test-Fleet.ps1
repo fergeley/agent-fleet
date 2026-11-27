@@ -111,6 +111,11 @@ class Program {
         $planSingle.Windows[0].Jobs[0].NativeEnv.CUSTOM_PUBLIC_VAR -cne 'val-200') {
         throw 'SingleWindow PrintPlan did not preserve per-job Args/Env.'
     }
+    if ($planSingle.Windows[0].Jobs[0].NativeEnv.FLEET_CLIENT -cne 'Codex' -or
+        $planSingle.Windows[0].Jobs[0].NativeEnv.FLEET_JOB_ID -cne 'job-1' -or
+        [string]::IsNullOrWhiteSpace([string]$planSingle.Windows[0].Jobs[0].NativeEnv.FLEET_NOTIFY)) {
+        throw 'SingleWindow PrintPlan did not add the Fleet notification environment.'
+    }
 
     $manifestWin = [ordered]@{} + $manifest
     $manifestWin.JobsLayout = 'JobWindows'
@@ -258,8 +263,12 @@ class Program {
         $receiptFile = Join-Path $fakeLocal 'AgentFleet/installation.json'
         $initManifestFile = Join-Path $fakeLocal 'AgentFleet/manifest.json'
         $rec = Get-Content -LiteralPath $receiptFile -Raw | ConvertFrom-Json
-        if ($rec.ReleaseVersion -cne '2.1.1' -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
+        $releaseVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'release.json') -Raw | ConvertFrom-Json).Version
+        if ($rec.ReleaseVersion -cne $releaseVersion -or $rec.UpdateProtocol -ne 2 -or $rec.AutoUpdateEnabled -ne $false) {
             throw "Install -Init receipt unexpected: $($rec | ConvertTo-Json)"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $fakeLocal 'AgentFleet/notifications/FleetNotify.ps1') -PathType Leaf)) {
+            throw 'The installer did not publish the notification files.'
         }
 
         $reOut = & $installer -DesktopDirectory $fakeDesktop -StartupDirectory $fakeStartup
@@ -277,6 +286,13 @@ class Program {
         if (-not (Test-Path -LiteralPath $profManifest -PathType Leaf)) { throw 'Profile manifest was not written.' }
         $rootJobs = (Get-Content -LiteralPath $initManifestFile -Raw | ConvertFrom-Json).Jobs.Count
         if ($rootJobs -ne 4) { throw 'Profile install clobbered root manifest.' }
+
+        $notifyConfig = Join-Path $tmpRoot 'notify-home'
+        [void][IO.Directory]::CreateDirectory($notifyConfig)
+        $notifyStatus = & $pwshExe -NoLogo -NoProfile -File (Join-Path $fakeLocal 'AgentFleet/Start-Fleet.ps1') -StatusNotifications -ConfigRoot $notifyConfig 2>&1
+        if ($LASTEXITCODE -ne 0 -or (($notifyStatus | Out-String) -notmatch 'Notifications: installed=')) {
+            throw "Start-Fleet -StatusNotifications failed: $notifyStatus"
+        }
     } finally {
         $env:USERPROFILE = $oldProfile; $env:LOCALAPPDATA = $oldLocal; $env:PATH = $oldPath
     }
@@ -314,8 +330,9 @@ class Program {
         return Get-Content -LiteralPath (Join-Path $pkg2 $name) -Raw
     }
     $updRes = Invoke-FleetUpdate $updRoot -Force
-    if ($updRes.Result -cne 'updated' -or $script:mockCalls -ne 9) {
-        throw "Public HTTPS update failed (mockCalls=$($script:mockCalls)): $($updRes | ConvertTo-Json)"
+    $expectedUpdateCalls = 2 + @(Get-FleetUpdateFiles 2).Count
+    if ($updRes.Result -cne 'updated' -or $script:mockCalls -ne $expectedUpdateCalls) {
+        throw "Public HTTPS update failed (mockCalls=$($script:mockCalls), expected=$expectedUpdateCalls): $($updRes | ConvertTo-Json)"
     }
     foreach ($f in @('Start-Fleet.ps1', 'FleetUpdate.ps1')) {
         Copy-Item -LiteralPath (Join-Path $runtimeRoot $f) -Destination (Join-Path $updRoot $f) -Force
@@ -698,7 +715,8 @@ public static class FleetTestWindows {
         return Get-Content -LiteralPath (Join-Path $runtimeRoot $relName) -Raw
     }
     $bootRes = Invoke-FleetRemoteBootstrap -Repo 'fergeley/agent-fleet' -Branch 'main' -StageRoot $bootStageGood -RunInstaller:$false
-    if ($bootRes.Result -cne 'staged' -or $bootRes.Version -cne '2.1.1') { throw 'install.ps1 valid verification failed.' }
+    $releaseVersion = (Get-Content -LiteralPath $relJsonPath -Raw | ConvertFrom-Json).Version
+    if ($bootRes.Result -cne 'staged' -or $bootRes.Version -cne $releaseVersion) { throw 'install.ps1 valid verification failed.' }
 
     function Invoke-FleetBootstrapFetch([string]$Uri, [string]$Accept) {
         if ($Uri -like '*/commits/main') { return (@{ sha = ('d' * 40) } | ConvertTo-Json) }

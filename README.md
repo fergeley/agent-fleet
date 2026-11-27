@@ -86,6 +86,39 @@ Add `~/.local/bin` to your `PATH`, then run `agent-fleet` (or `fleet`).
 - `agent-fleet -Update` / `-Rollback` / `-AutoUpdate On|Off`: Manage signed SHA-256 runtime updates over public GitHub HTTPS (Protocol 2).
 - `agent-fleet -Arrange`: Move the open job windows back to their tiles, or the shared window back to the monitor under the pointer.
 - `agent-fleet -Job <id> -ResetPending`: Clear the pending launch of one job. Run it only when no window or client of that launch is still running.
+- `agent-fleet -InstallNotifications`, `-TestNotifications`, `-StatusNotifications`, `-MuteNotifications`, `-UnmuteNotifications`, `-UninstallNotifications`: Manage the optional per-provider notification sounds.
+
+## Notification sounds
+
+Agent Fleet can play a distinct sound when a client finishes, needs approval or a question, or fails. The feature is opt-in and Windows-only.
+
+```powershell
+agent-fleet -InstallNotifications
+agent-fleet -TestNotifications
+agent-fleet -StatusNotifications
+agent-fleet -MuteNotifications
+agent-fleet -UnmuteNotifications
+agent-fleet -UninstallNotifications
+```
+
+The installer merges hooks into the user configuration for Claude Code, Codex, Antigravity, and OpenCode. It backs up each file and writes a receipt under `%LOCALAPPDATA%\AgentFleet\notifications`. Uninstall restores the backups when the file has not changed since installation; otherwise it removes only the Fleet hooks.
+
+- **Claude Code**: `Stop`, `Notification` with `permission_prompt|idle_prompt`, and `StopFailure`.
+- **Codex**: `Stop` and `PermissionRequest`. Codex requires you to review and trust the hooks once with `/hooks`.
+- **Antigravity**: a `fleet-notify` hook entry with `PreToolUse` for `ask_permission|ask_question` and `Stop`. Restart Antigravity after installation.
+- **OpenCode**: the built-in `attention` settings in `~/.config/opencode/cli.json` or `tui.json`.
+
+The default sounds are Windows system sounds. `notifications.json` is the shipped matrix and is replaced on update. Add `notifications.local.json` in `%LOCALAPPDATA%\AgentFleet\notifications` to override a provider or job; it is preserved. The precedence is job override, provider override, default. `notifications.local.json` also accepts `"muted": true`. Set `"Focus": { "done": "unfocused" }` to skip the completion sound while Windows Terminal is in front; `attention` and `error` default to `always`.
+
+Each Fleet job receives `FLEET_CLIENT`, `FLEET_JOB_ID`, `FLEET_PROFILE`, and `FLEET_NOTIFY` in its environment. A client outside Fleet can call the notifier directly:
+
+```powershell
+& "$env:LOCALAPPDATA\AgentFleet\notifications\FleetNotify.ps1" -Client Custom -Event attention -Message "Build failed"
+```
+
+The notifier exits 0 and writes a JSONL log to `notify.log`. Use `-LogOnly` to test the resolution without playing a sound, and `-Force` to ignore mute and focus.
+
+If Claude Ping or another notifier is installed, remove its hooks before installing these. Two owners for one event produce two sounds.
 
 ## How a Windows launch behaves
 

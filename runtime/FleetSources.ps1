@@ -529,6 +529,14 @@ function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]
             $jobWindowName = "AgentFleetJob-$lockHash-$($entry.Id)-$nonce"
             $jobTitle = "Agent Fleet Job [$($entry.Id)] | $($entry.Client) | $lockHash/$nonce"
         }
+        $nativeEnv = [ordered]@{}
+        if ($null -ne $entry.NativeEnv) {
+            foreach ($key in $entry.NativeEnv.Keys) { $nativeEnv[$key] = $entry.NativeEnv[$key] }
+        }
+        $nativeEnv['FLEET_CLIENT'] = $entry.Client
+        $nativeEnv['FLEET_JOB_ID'] = $entry.Id
+        if ($Profile) { $nativeEnv['FLEET_PROFILE'] = $Profile }
+        $nativeEnv['FLEET_NOTIFY'] = Join-Path (Join-Path $InstallRoot 'notifications') 'FleetNotify.ps1'
         $item = [ordered]@{
             Id = $entry.Id
             Client = $entry.Client
@@ -538,7 +546,7 @@ function Get-FleetJobs($Manifest, [string]$InstallRoot = $PSScriptRoot, [string]
             ObservedHead = $entry.ObservedHead
             NativeExecutable = $executable
             NativeArguments = @($entry.NativeArguments)
-            NativeEnv = $entry.NativeEnv
+            NativeEnv = $nativeEnv
             Nonce = $nonce
             InstallationTag = $lockHash
             Property = "AgentFleet.$lockHash.Job.$($entry.Id)"

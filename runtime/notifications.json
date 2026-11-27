@@ -1,0 +1,36 @@
+{
+  "Version": 1,
+  "Focus": {
+    "done": "always",
+    "attention": "always",
+    "error": "always"
+  },
+  "Claude": {
+    "done": "%SystemRoot%\\Media\\chimes.wav",
+    "attention": "%SystemRoot%\\Media\\Windows Balloon.wav",
+    "error": "%SystemRoot%\\Media\\Alarm03.wav"
+  },
+  "Codex": {
+    "done": "%SystemRoot%\\Media\\notify.wav",
+    "attention": "%SystemRoot%\\Media\\ding.wav",
+    "error": "%SystemRoot%\\Media\\Alarm05.wav"
+  },
+  "Antigravity": {
+    "done": "%SystemRoot%\\Media\\Windows Background.wav",
+    "attention": "%SystemRoot%\\Media\\Alarm02.wav",
+    "error": "%SystemRoot%\\Media\\Alarm07.wav"
+  },
+  "OpenCode": {
+    "done": "%SystemRoot%\\Media\\Windows Notify System Generic.wav",
+    "attention": "%SystemRoot%\\Media\\Alarm06.wav",
+    "error": "%SystemRoot%\\Media\\Alarm09.wav"
+  },
+  "Fleet": {
+    "error": "%SystemRoot%\\Media\\Alarm01.wav"
+  },
+  "default": {
+    "done": "%SystemRoot%\\Media\\notify.wav",
+    "attention": "%SystemRoot%\\Media\\chimes.wav",
+    "error": "%SystemRoot%\\Media\\Alarm03.wav"
+  }
+}

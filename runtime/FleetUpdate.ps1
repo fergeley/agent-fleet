@@ -2,7 +2,10 @@ $ErrorActionPreference = 'Stop'
 
 function Get-FleetUpdateFiles([int]$Protocol = 2) {
     if ($Protocol -ne 2) { throw "The Fleet update protocol is incompatible: $Protocol" }
-    @('Fleet.ps1', 'FleetJobs.ps1', 'FleetDispatch.ps1', 'FleetWindow.cs', 'FleetSources.ps1', 'Open-Fleet.ps1', 'README.md')
+    @(
+        'Fleet.ps1', 'FleetJobs.ps1', 'FleetDispatch.ps1', 'FleetWindow.cs', 'FleetSources.ps1', 'Open-Fleet.ps1',
+        'FleetNotify.ps1', 'FleetNotifyInstall.ps1', 'FleetNotifyAntigravity.ps1', 'notifications.json', 'README.md'
+    )
 }
 
 function Get-FleetEntryLockHash([string]$InstallRoot, [string]$Profile = '') {
@@ -161,6 +164,22 @@ function Publish-FleetGeneration([string]$InstallRoot, [string]$SourceRoot, [Sys
     } catch {
         Remove-FleetPackageFiles $destination
         throw
+    }
+}
+
+function Publish-FleetNotifyFiles([string]$InstallRoot, [string]$SourceRoot, [System.Collections.IDictionary]$Release) {
+    $destination = Join-Path $InstallRoot 'notifications'
+    [void][IO.Directory]::CreateDirectory($destination)
+    foreach ($file in @('FleetNotify.ps1', 'FleetNotifyInstall.ps1', 'FleetNotifyAntigravity.ps1', 'notifications.json')) {
+        if (-not $Release.Files.Contains($file)) { throw "The Fleet release manifest is missing $file." }
+        $bytes = [byte[]](Get-FleetReleaseBytes (Join-Path $SourceRoot $file))
+        $temporary = Join-Path $destination ('.' + $file + '.' + [Guid]::NewGuid().ToString('n') + '.tmp')
+        try {
+            [IO.File]::WriteAllBytes($temporary, $bytes)
+            [IO.File]::Move($temporary, (Join-Path $destination $file), $true)
+        } finally {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        }
     }
 }
 
@@ -392,6 +411,7 @@ function Invoke-FleetUpdate([string]$InstallRoot, [switch]$Force) {
             }
             Assert-FleetReleaseFiles $download $release
             $relative = Publish-FleetGeneration $InstallRoot $download $release
+            Publish-FleetNotifyFiles -InstallRoot $InstallRoot -SourceRoot $download -Release $release
             $previousRuntime = [ordered]@{
                 UpdateProtocol = $receipt.UpdateProtocol
                 RuntimeDirectory = $receipt.RuntimeDirectory
