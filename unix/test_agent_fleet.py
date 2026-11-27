@@ -125,6 +125,24 @@ class AgentFleetUnixTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 af.get_relative_copy_paths(self.repo, manifest={"WorktreeCopyFiles": [bad_rel]})
 
+    def test_worktree_is_locked_at_checkout_only_when_requested(self) -> None:
+        hooks = self.root / "checkout-hooks"
+        hooks.mkdir()
+        checkout_hook = hooks / "post-checkout"
+        checkout_hook.write_text(
+            '#!/bin/sh\nif test -f "$(git rev-parse --git-path locked)"; then\n'
+            '    printf locked >lock-at-checkout\nelse\n    printf unlocked >lock-at-checkout\nfi\n',
+            encoding="utf-8",
+        )
+        checkout_hook.chmod(0o755)
+        subprocess.run(["git", "-C", str(self.repo), "config", "core.hooksPath", str(hooks)], check=True)
+
+        for lock, expected in [(True, "locked"), (False, "unlocked")]:
+            wt = self.root / expected
+            result = af.new_worktree(str(self.repo), str(wt), base_ref="HEAD", lock=lock)
+            self.assertEqual(result["Locked"], lock)
+            self.assertEqual((wt / "lock-at-checkout").read_text(encoding="utf-8"), expected)
+
     def test_clean_worktree_guards_and_removal(self) -> None:
         install = self.root / "install"
         install.mkdir(parents=True, exist_ok=True)

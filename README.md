@@ -78,7 +78,7 @@ Add `~/.local/bin` to your `PATH`, then run `agent-fleet` (or `fleet`).
 - `agent-fleet -Profile <name>`: Launch or manage an isolated workspace profile (`profiles/<name>/manifest.json`).
 - `agent-fleet -PrintPlan`: Inspect resolved tabs, worktrees, client args, and commit SHAs without launching.
 - `agent-fleet -Status [-Json | -Watch [-IntervalSeconds 3]]`: Inspect window/`tmux` state, Git branch/dirty counts, and live `claude agents --json --all` sessions.
-- `agent-fleet -NewWorktree <path> -Repository <repo> -Branch <name> [-Lock]`: Create an isolated Git worktree and copy configured untracked env files.
+- `agent-fleet -NewWorktree <path> -Repository <repo> [-Branch <name>] [-Lock]`: Create an isolated Git worktree and copy configured untracked env files. Omit `-Branch` for a detached worktree.
 - `agent-fleet -OpenTab -Client Antigravity -Repository <repo> -Branch <name> [-TabColor #40a02b]`: Create a worktree if needed and open an ad-hoc tab inside the live Agent Fleet window.
 - `agent-fleet -CleanWorktree <path> [-DryRun] [-Force]`: Safely unlock and remove an unused linked worktree after verifying it is not the main repo, not configured in Agent Fleet, not CWD, clean, and merged/pushed.
 - `agent-fleet -Dispatch -Client Claude|Codex -Directory <dir> -Prompt "<task>"`: Start a background session (`claude --bg` or `codex exec --json`). Codex reads the prompt from standard input. A Claude prompt cannot start with `-`. The manifest must name the client program file (`.exe`), not a `.cmd` shim, because `cmd.exe` would parse the prompt again.
@@ -86,6 +86,10 @@ Add `~/.local/bin` to your `PATH`, then run `agent-fleet` (or `fleet`).
 - `agent-fleet -Update` / `-Rollback` / `-AutoUpdate On|Off`: Manage signed SHA-256 runtime updates over public GitHub HTTPS (Protocol 2).
 - `agent-fleet -Arrange`: Move the open job windows back to their tiles, or the shared window back to the monitor under the pointer.
 - `agent-fleet -Job <id> -ResetPending`: Clear the pending launch of one job. Run it only when no window or client of that launch is still running.
+
+Use `-Lock` on Windows or `--lock` on macOS and Linux when creating a reusable job worktree.
+Git applies the lock during creation. For an existing reusable worktree, run `git worktree lock <path>`.
+Check the lock with `git worktree list --porcelain`. Use separate worktrees for tasks that need cleanup.
 
 ## How a Windows launch behaves
 

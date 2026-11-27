@@ -584,14 +584,12 @@ def new_worktree(
 
     os.makedirs(os.path.dirname(target_abs), exist_ok=True)
     cmd = ["git", "-C", repo_abs, "worktree", "add"]
+    if lock:
+        cmd.append("--lock")
     cmd.extend(["-b", branch, target_abs, base_ref] if branch else ["--detach", target_abs, base_ref])
     add_proc = subprocess.run(cmd, capture_output=True, text=True)
     if add_proc.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {add_proc.stderr.strip()}")
-    if lock:
-        lock_proc = subprocess.run(["git", "-C", repo_abs, "worktree", "lock", target_abs, "--reason", "Agent Fleet job slot"], capture_output=True, text=True)
-        if lock_proc.returncode != 0:
-            raise RuntimeError(f"Worktree created, but lock failed: {lock_proc.stderr.strip()}")
     copied, skipped = copy_worktree_files(copy_root, Path(target_abs), rel_copy_paths)
     return {
         "Result": "created",

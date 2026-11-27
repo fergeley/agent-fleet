@@ -292,6 +292,7 @@ function New-FleetWorktree([string]$Repository, [string]$Path, [string]$BaseRef 
         [void][IO.Directory]::CreateDirectory($parentDir)
     }
     $gitArgs = @('-C', $Repository, 'worktree', 'add')
+    if ($Lock) { $gitArgs += '--lock' }
     if (-not [string]::IsNullOrWhiteSpace($Branch)) {
         $gitArgs += @('-b', $Branch, $fullTarget, $BaseRef)
     } else {
@@ -300,12 +301,6 @@ function New-FleetWorktree([string]$Repository, [string]$Path, [string]$BaseRef 
     $addOutput = & git @gitArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "git worktree add failed: $($addOutput | Out-String)"
-    }
-    if ($Lock) {
-        $lockOutput = & git -C $Repository worktree lock $fullTarget --reason 'Agent Fleet job slot' 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Worktree created at $fullTarget, but lock failed: $($lockOutput | Out-String)"
-        }
     }
     $copyReport = Copy-FleetWorktreeFiles $copyRoot $fullTarget $copyPaths
     [pscustomobject]@{
